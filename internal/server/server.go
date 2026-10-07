@@ -127,9 +127,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 	} else {
 		body, err = s.blobs.Get(ctx, e.BlobHash)
 		if errors.Is(err, ErrBlobMissing) {
-			s.log.Warn("blob missing from object store, dropping it", "hash", hex.EncodeToString(e.BlobHash))
-			if err := s.store.DropBlob(ctx, e.BlobHash); err != nil {
-				s.log.Error("drop blob", "err", err)
+			s.log.Warn("blob missing from object store", "hash", hex.EncodeToString(e.BlobHash))
+			dropped, derr := s.store.DropMissingBlob(ctx, e.BlobHash, s.blobs.Exists)
+			if derr != nil {
+				s.log.Error("drop blob", "err", derr)
+			} else if dropped {
+				s.log.Warn("dropped blob and its entries", "hash", hex.EncodeToString(e.BlobHash))
 			}
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -155,8 +158,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 	h.Set(api.HeaderTime, e.CreatedAt.UTC().Format(time.RFC3339Nano))
 	h.Set(api.HeaderScope, e.Scope)
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, body); err != nil {
-		s.log.Debug("send body", "err", err)
+	n, err := io.Copy(w, io.LimitReader(body, e.Size+1))
+	if err != nil || n != e.Size {
+		// Headers are sent. Abort the connection so the client sees a broken
+		// response instead of a short body.
+		s.log.Warn("short or failed body", "hash", hex.EncodeToString(e.BlobHash), "sent", n, "size", e.Size, "err", err)
+		panic(http.ErrAbortHandler)
 	}
 }
 

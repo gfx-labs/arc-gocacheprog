@@ -1,0 +1,48 @@
+# Local stack: postgres, seaweedfs (S3) and the cache server.
+#   docker compose -f deploy/docker-compose.yaml up --build
+# Server on http://localhost:8080, static key "dev-key" (see config.compose.yaml).
+name: arcgocache
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: arcgocache
+      POSTGRES_PASSWORD: arcgocache
+      POSTGRES_DB: arcgocache
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arcgocache -d arcgocache"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  seaweedfs:
+    image: chrislusf/seaweedfs
+    command: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
+    volumes:
+      - seaweed:/data
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    ports:
+      - "${SEAWEEDFS_S3_PORT:-8333}:8333"
+
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["-config", "/etc/arc-gocacheprog/config.yaml"]
+    volumes:
+      - ./config.compose.yaml:/etc/arc-gocacheprog/config.yaml:ro
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
+    restart: on-failure
+
+volumes:
+  pgdata:
+  seaweed:

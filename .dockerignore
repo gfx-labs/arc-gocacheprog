@@ -1,0 +1,9 @@
+.git
+.github
+.gitignore
+.dockerignore
+Dockerfile
+deploy
+*.md
+*.test
+/bin

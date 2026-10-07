@@ -1,0 +1,97 @@
+# Example arc-gocacheprog-server config.
+# ${VAR} references are expanded from the environment before parsing.
+# Run: arc-gocacheprog-server -config config.yaml   (or ARC_GOCACHE_CONFIG=...)
+
+# Listen address.
+listen: ":8080"
+
+# Postgres connection string. Holds metadata, small blobs and the GC lock.
+# Schema migrations run at startup.
+database_url: ${DATABASE_URL}
+
+s3:
+  # Leave empty for AWS S3. Set for SeaweedFS, MinIO and other S3 compatible stores.
+  endpoint: http://seaweedfs-s3.storage.svc:8333
+  region: us-east-1
+  bucket: gocache
+  # Object key prefix. Objects land at <prefix><h[0:2]>/<h[2:4]>/<blake3 hash>.
+  prefix: gocache/
+  access_key_id: ${S3_ACCESS_KEY_ID}
+  secret_access_key: ${S3_SECRET_ACCESS_KEY}
+  # Path style addressing. Defaults to true when endpoint is set.
+  use_path_style: true
+  # Create the bucket at startup if it is missing.
+  create_bucket: false
+
+storage:
+  # Blobs at or below this size are stored in postgres, larger ones in S3.
+  inline_max_bytes: 32768
+  # Uploads larger than this are rejected.
+  max_blob_bytes: 1073741824
+  # Parallel PUTs. Further uploads get 503 and the client retries.
+  max_concurrent_uploads: 32
+  # Bounds reading a request and writing a response.
+  request_timeout: 15m
+  # Access timestamps are only rewritten when older than this.
+  touch_interval: 1h
+  # Large uploads are spooled here while they are hashed. Empty uses the OS temp dir.
+  temp_dir: ""
+
+gc:
+  enabled: true
+  interval: 1h
+  # Delete entries not accessed for this long.
+  entry_ttl: 168h
+  # Keep unreferenced blobs and unowned S3 objects this long.
+  blob_grace: 6h
+  # How long an in-progress upload protects its S3 object from GC.
+  # Must be >= storage.request_timeout.
+  upload_lease: 1h
+  # Per namespace quota in bytes. Least recently used entries are evicted
+  # once the total exceeds it, entries in protected_scopes last. 0 disables.
+  namespace_max_bytes: 21474836480
+  # Scopes evicted last. gha default_refs are added automatically.
+  # protected_scopes: [refs/heads/release]
+  # List the bucket and remove objects that have no blob row.
+  orphan_sweep: true
+
+auth:
+  # GitHub Actions OIDC. Remove this block to disable.
+  gha:
+    issuer: https://token.actions.githubusercontent.com
+    # Overrides OIDC discovery of the signing keys.
+    # jwks_url: https://token.actions.githubusercontent.com/.well-known/jwks
+    # Must match ARC_GOCACHE_AUDIENCE on the client.
+    audience: arc-gocacheprog
+    # Owners allowed to use the cache, by repository_owner_id. Prefer IDs:
+    # names can be re-registered after deletion.
+    # Find it with: gh api orgs/gfx-labs --jq .id
+    # allowed_owner_ids: ["12345678"]
+    # Owners by name.
+    allowed_owners: [gfx-labs]
+    # Optional "owner/name" allowlist, checked in addition to allowed_owners.
+    # allowed_repositories: [gfx-labs/example]
+    # Accept tokens from any repository. Only for public setups.
+    # allow_any_owner: false
+    # Refs every job may read besides its own ref and the PR base ref.
+    default_refs: [master, main]
+    # Workflow events (token event_name) allowed to write. Other events are
+    # read only. pull_request_target, workflow_run and issue_comment run with
+    # the default branch as ref and must not write.
+    write_events: [push, pull_request, merge_group, workflow_dispatch, schedule]
+    # Also accept ACTIONS_RUNTIME_TOKEN, with scopes taken from its "ac" claim.
+    accept_runtime_token: false
+    # Issuers accepted for runtime tokens. Empty means only `issuer`.
+    # runtime_token_issuers: []
+    # JWKS for runtime tokens when their issuer does not serve OIDC discovery.
+    # runtime_token_jwks_url: ""
+
+  # Static keys for local use and scripts.
+  # Generate the hash with:  printf %s "$KEY" | sha256sum | cut -d' ' -f1
+  static:
+    - name: local-dev
+      key_sha256: ${LOCAL_KEY_SHA256}
+      namespace: local
+      write_scope: master
+      read_scopes: [master]
+      read_only: false

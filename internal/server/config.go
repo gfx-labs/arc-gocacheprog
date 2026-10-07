@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -56,6 +58,10 @@ type GCConfig struct {
 	// NamespaceMaxBytes evicts least recently used entries per namespace
 	// once the sum of entry sizes exceeds it. 0 disables.
 	NamespaceMaxBytes int64 `yaml:"namespace_max_bytes"`
+	// ProtectedScopes are evicted last by the namespace quota, so feature
+	// branches filling the quota do not push out the default branch cache.
+	// gha default_refs are always included.
+	ProtectedScopes []string `yaml:"protected_scopes"`
 	// OrphanSweep lists the bucket and removes objects with no blob row.
 	OrphanSweep bool `yaml:"orphan_sweep"`
 	// UploadLease is how long an in-progress upload protects its object from
@@ -76,6 +82,9 @@ type GHAConfig struct {
 	Audience string `yaml:"audience"`
 	// AllowedOwners restricts which GitHub owners (orgs/users) may use the cache.
 	AllowedOwners []string `yaml:"allowed_owners"`
+	// AllowedOwnerIDs matches repository_owner_id. Prefer this over names,
+	// which can be re-registered after deletion.
+	AllowedOwnerIDs []string `yaml:"allowed_owner_ids"`
 	// AllowedRepositories restricts to "owner/name" entries. Checked in
 	// addition to AllowedOwners when both are set.
 	AllowedRepositories []string `yaml:"allowed_repositories"`
@@ -165,16 +174,25 @@ func (c *Config) Validate() error {
 		if g.Audience == "" {
 			g.Audience = "arc-gocacheprog"
 		}
+		for _, r := range g.DefaultRefs {
+			if q := qualifyBranch(r); !slices.Contains(c.GC.ProtectedScopes, q) {
+				c.GC.ProtectedScopes = append(c.GC.ProtectedScopes, q)
+			}
+		}
 		if g.WriteEvents == nil {
 			g.WriteEvents = DefaultWriteEvents
 		}
-		if !g.AllowAnyOwner && len(g.AllowedOwners) == 0 && len(g.AllowedRepositories) == 0 {
-			return fmt.Errorf("auth.gha needs allowed_owners, allowed_repositories, or allow_any_owner: true")
+		if !g.AllowAnyOwner && len(g.AllowedOwners) == 0 && len(g.AllowedOwnerIDs) == 0 && len(g.AllowedRepositories) == 0 {
+			return fmt.Errorf("auth.gha needs allowed_owner_ids, allowed_owners, allowed_repositories, or allow_any_owner: true")
 		}
 	}
 	for i, k := range c.Auth.Static {
 		if k.Key == "" && k.KeySHA256 == "" {
 			return fmt.Errorf("auth.static[%d]: key or key_sha256 is required", i)
+		}
+		// Tokens with exactly two dots are routed to JWT verification.
+		if strings.Count(k.Key, ".") == 2 {
+			return fmt.Errorf("auth.static[%d]: key must not contain exactly two '.' characters", i)
 		}
 		if k.Namespace == "" {
 			return fmt.Errorf("auth.static[%d]: namespace is required", i)

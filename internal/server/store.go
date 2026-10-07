@@ -261,14 +261,37 @@ func (s *Store) BlobExists(ctx context.Context, hash []byte) (*BlobInfo, error) 
 	return &b, err
 }
 
-// DropBlob removes a blob row and every entry that references it. Used when
-// the object is found missing from S3 so the cache heals itself.
-func (s *Store) DropBlob(ctx context.Context, hash []byte) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+// DropMissingBlob removes a blob row and every entry that references it
+// after confirming, under the exclusive per-hash lock, that the object is
+// still missing and no upload of it is in progress. A single transient
+// not-found therefore cannot wipe entries.
+func (s *Store) DropMissingBlob(ctx context.Context, hash []byte, exists func(context.Context, []byte) (bool, error)) (bool, error) {
+	dropped := false
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock("+hashLockKey+")", hash); err != nil {
+			return err
+		}
+		var leased, inline bool
+		if err := tx.QueryRow(ctx, `SELECT
+			EXISTS (SELECT 1 FROM upload_leases WHERE hash = $1),
+			COALESCE((SELECT inline_data IS NOT NULL FROM blobs WHERE hash = $1), true)`, hash).Scan(&leased, &inline); err != nil {
+			return err
+		}
+		if leased || inline {
+			return nil
+		}
+		ok, err := exists(ctx, hash)
+		if err != nil || ok {
+			return err
+		}
 		if _, err := tx.Exec(ctx, "DELETE FROM entries WHERE blob_hash = $1", hash); err != nil {
 			return err
 		}
-		_, err := tx.Exec(ctx, "DELETE FROM blobs WHERE hash = $1", hash)
-		return err
+		if _, err := tx.Exec(ctx, "DELETE FROM blobs WHERE hash = $1", hash); err != nil {
+			return err
+		}
+		dropped = true
+		return nil
 	})
+	return dropped, err
 }

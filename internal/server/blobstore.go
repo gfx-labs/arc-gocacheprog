@@ -133,6 +133,23 @@ func (b *BlobStore) Get(ctx context.Context, hash []byte) (io.ReadCloser, error)
 	return out.Body, nil
 }
 
+// Exists reports whether the object for hash exists.
+func (b *BlobStore) Exists(ctx context.Context, hash []byte) (bool, error) {
+	_, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(b.Key(hash)),
+	})
+	if err == nil {
+		return true, nil
+	}
+	var nsk *types.NoSuchKey
+	var nf *types.NotFound
+	if errors.As(err, &nsk) || errors.As(err, &nf) {
+		return false, nil
+	}
+	return false, fmt.Errorf("s3 head %x: %w", hash, err)
+}
+
 func (b *BlobStore) Delete(ctx context.Context, hash []byte) error {
 	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),

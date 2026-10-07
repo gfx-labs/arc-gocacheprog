@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -233,11 +234,13 @@ func (g *ghaAuth) verify(ctx context.Context, raw, issuer string, audience bool)
 	})
 	tok, err := v.Verify(ctx, raw)
 	if err != nil {
-		return nil, unauthorized("invalid token: %v", err)
+		slog.Debug("token verification failed", "err", err)
+		return nil, unauthorized("invalid token")
 	}
 	var c ghaClaims
 	if err := tok.Claims(&c); err != nil {
-		return nil, unauthorized("invalid claims: %v", err)
+		slog.Debug("token claims invalid", "err", err)
+		return nil, unauthorized("invalid token")
 	}
 	return &c, nil
 }
@@ -265,7 +268,7 @@ type acScope struct {
 func (g *ghaAuth) authenticate(ctx context.Context, raw string) (*Identity, error) {
 	unverified, err := parseUnverified(raw)
 	if err != nil {
-		return nil, unauthorized("malformed token: %v", err)
+		return nil, unauthorized("invalid token")
 	}
 	if unverified.AC != "" {
 		return g.authenticateRuntime(ctx, raw, unverified.Issuer)
@@ -277,7 +280,7 @@ func (g *ghaAuth) authenticate(ctx context.Context, raw string) (*Identity, erro
 	if c.RepositoryID == "" || c.Repository == "" || c.Ref == "" {
 		return nil, unauthorized("token is missing repository_id, repository or ref")
 	}
-	if err := g.checkRepo(c.Repository, c.RepositoryOwner, c.RepositoryID); err != nil {
+	if err := g.checkRepo(c); err != nil {
 		return nil, err
 	}
 	id := &Identity{
@@ -315,7 +318,8 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 		issuers = []string{g.cfg.Issuer}
 	}
 	if !slices.Contains(issuers, issuer) {
-		return nil, unauthorized("runtime token issuer %q is not trusted", issuer)
+		slog.Debug("untrusted runtime token issuer", "iss", issuer)
+		return nil, unauthorized("invalid token")
 	}
 	// Runtime tokens are signed with the same keys but carry a different
 	// issuer and an audience we do not control.
@@ -326,12 +330,13 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 	if c.RepositoryID == "" {
 		return nil, unauthorized("runtime token has no repository_id")
 	}
-	if err := g.checkRepo(c.Repository, c.RepositoryOwner, c.RepositoryID); err != nil {
+	if err := g.checkRepo(c); err != nil {
 		return nil, err
 	}
 	var scopes []acScope
 	if err := json.Unmarshal([]byte(c.AC), &scopes); err != nil {
-		return nil, unauthorized("invalid ac claim: %v", err)
+		slog.Debug("invalid ac claim", "err", err)
+		return nil, unauthorized("invalid token")
 	}
 	id := &Identity{Kind: "gha-runtime", Subject: c.Subject, Namespace: "gh:" + c.RepositoryID}
 	// Highest permission first, matching how the actions cache service orders lookups.
@@ -353,30 +358,38 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 	return id, nil
 }
 
-// checkRepo enforces the owner and repository allowlists. Runtime tokens may
-// not carry repository names, so repository IDs are accepted in the
-// allowed_repositories list as well.
-func (g *ghaAuth) checkRepo(repo, owner, repoID string) error {
+// checkRepo enforces the allowlists. Numeric IDs are preferred since names
+// can be reused after an account or repository is deleted. Runtime tokens may
+// not carry names, so repository IDs are accepted in allowed_repositories.
+func (g *ghaAuth) checkRepo(c *ghaClaims) error {
 	if g.cfg.AllowAnyOwner {
 		return nil
 	}
-	if owner == "" && repo != "" {
-		owner, _, _ = strings.Cut(repo, "/")
+	owner := c.RepositoryOwner
+	if owner == "" && c.Repository != "" {
+		owner, _, _ = strings.Cut(c.Repository, "/")
 	}
-	ownerOK := len(g.cfg.AllowedOwners) == 0
+	ownerSet := len(g.cfg.AllowedOwners) > 0 || len(g.cfg.AllowedOwnerIDs) > 0
+	ownerOK := !ownerSet
 	for _, o := range g.cfg.AllowedOwners {
 		if owner != "" && strings.EqualFold(o, owner) {
 			ownerOK = true
 		}
 	}
+	for _, id := range g.cfg.AllowedOwnerIDs {
+		if c.RepositoryOwnerID != "" && id == c.RepositoryOwnerID {
+			ownerOK = true
+		}
+	}
 	repoOK := len(g.cfg.AllowedRepositories) == 0
 	for _, r := range g.cfg.AllowedRepositories {
-		if (repo != "" && strings.EqualFold(r, repo)) || r == repoID {
+		if (c.Repository != "" && strings.EqualFold(r, c.Repository)) || r == c.RepositoryID {
 			repoOK = true
 		}
 	}
 	if !ownerOK || !repoOK {
-		return forbidden("repository %q (id %s) is not allowed", repo, repoID)
+		slog.Info("repository not allowed", "repository", c.Repository, "repository_id", c.RepositoryID, "owner_id", c.RepositoryOwnerID)
+		return forbidden("repository is not allowed")
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gfx-labs/arc-gocacheprog/internal/client"
 	"github.com/gfx-labs/arc-gocacheprog/internal/server"
 )
 
@@ -208,4 +210,63 @@ func parseStats(t testing.TB, stderr string) map[string]int64 {
 	}
 	t.Fatalf("no stats line in output:\n%s", stderr)
 	return nil
+}
+
+func TestQuotaProtectsDefaultRefs(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tok := func(ref string) *client.Remote {
+		return remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", ref, nil)))
+	}
+	main, feat := tok("refs/heads/main"), tok("refs/heads/feature")
+	mb := newBlob(t, 4096)
+	if err := put(t, main, action("main"), mb); err != nil {
+		t.Fatal(err)
+	}
+	// Main's entry is older than every feature entry.
+	e.Store.Pool().Exec(ctx, `UPDATE entries SET accessed_at = now() - interval '1 day'`) //nolint:errcheck
+	for i := range 4 {
+		if err := put(t, feat, action(fmt.Sprint("f", i)), newBlob(t, 4096)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gc := server.NewGC(server.GCConfig{NamespaceMaxBytes: 3 * 4096, ProtectedScopes: e.Config.GC.ProtectedScopes, BlobGrace: time.Hour}, e.Store, e.Blobs, nil)
+	st, err := gc.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.EvictedEntries != 2 {
+		t.Fatalf("expected 2 evictions, got %+v", st)
+	}
+	if got, _ := get(t, main, action("main")); !bytes.Equal(got, mb.data) {
+		t.Fatal("protected default branch entry was evicted")
+	}
+}
+
+func TestMissingObjectHeals(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	r := remote(e, testKey)
+	b := newBlob(t, 4096)
+	if err := put(t, r, action("a"), b); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Blobs.Delete(ctx, b.blake3); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := get(t, r, action("a")); got != nil || err != nil {
+		t.Fatalf("expected miss, got %v %v", got != nil, err)
+	}
+	var n int
+	e.Store.Pool().QueryRow(ctx, "SELECT count(*) FROM blobs").Scan(&n) //nolint:errcheck
+	if n != 0 {
+		t.Fatal("missing blob row was not dropped")
+	}
+	// Uploading again restores it rather than linking to the dead blob.
+	if err := put(t, r, action("a"), b); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := get(t, r, action("a")); !bytes.Equal(got, b.data) {
+		t.Fatal("re-upload did not restore the object")
+	}
 }

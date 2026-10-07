@@ -124,25 +124,38 @@ func (g *GC) expireEntries(ctx context.Context) (int64, error) {
 	}
 }
 
-// evictOverQuota deletes least recently accessed entries in namespaces whose
-// total entry size exceeds the quota. Sizes are logical, so a blob shared by
-// two entries counts twice.
+// evictOverQuota deletes entries in namespaces whose total entry size
+// exceeds the quota. Entries in protected scopes are kept over others, then
+// most recently accessed first. Sizes are logical, so a blob shared by two
+// entries counts twice. Deletes run in batches.
 func (g *GC) evictOverQuota(ctx context.Context) (int64, error) {
-	tag, err := g.store.pool.Exec(ctx, `
-		DELETE FROM entries e USING (
-			SELECT namespace, scope, action_id FROM (
-				SELECT namespace, scope, action_id,
-				       sum(size) OVER (PARTITION BY namespace
-				                       ORDER BY accessed_at DESC, created_at DESC, scope, action_id) AS running
-				FROM entries
-			) r WHERE running > $1
-		) v
-		WHERE e.namespace = v.namespace AND e.scope = v.scope AND e.action_id = v.action_id`,
-		g.cfg.NamespaceMaxBytes)
-	if err != nil {
-		return 0, err
+	protected := g.cfg.ProtectedScopes
+	if protected == nil {
+		protected = []string{}
 	}
-	return tag.RowsAffected(), nil
+	var total int64
+	for {
+		tag, err := g.store.pool.Exec(ctx, `
+			DELETE FROM entries e USING (
+				SELECT namespace, scope, action_id FROM (
+					SELECT namespace, scope, action_id,
+					       sum(size) OVER (PARTITION BY namespace
+					                       ORDER BY (scope = ANY($2)) DESC, accessed_at DESC,
+					                                created_at DESC, scope, action_id) AS running
+					FROM entries
+				) r WHERE running > $1
+				LIMIT $3
+			) v
+			WHERE e.namespace = v.namespace AND e.scope = v.scope AND e.action_id = v.action_id`,
+			g.cfg.NamespaceMaxBytes, protected, gcBatch)
+		if err != nil {
+			return total, err
+		}
+		total += tag.RowsAffected()
+		if tag.RowsAffected() < gcBatch {
+			return total, nil
+		}
+	}
 }
 
 // deleteUnreferencedBlobs removes blob rows no entry points at that have not
