@@ -28,13 +28,19 @@ type Server struct {
 	blobs *BlobStore
 	auth  *Authenticator
 	log   *slog.Logger
+	// uploadSlots bounds concurrent PUTs (spooled bodies and S3 writes).
+	uploadSlots chan struct{}
 }
 
 func New(cfg Config, store *Store, blobs *BlobStore, auth *Authenticator, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{cfg: cfg, store: store, blobs: blobs, auth: auth, log: log}
+	n := cfg.Storage.MaxConcurrentUploads
+	if n <= 0 {
+		n = 32
+	}
+	return &Server{cfg: cfg, store: store, blobs: blobs, auth: auth, log: log, uploadSlots: make(chan struct{}, n)}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -198,7 +204,7 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request, id *Identity
 		return
 	}
 	ctx := r.Context()
-	b, err := s.store.NamespaceHasBlob(ctx, id.Namespace, m.blake3)
+	b, err := s.store.LinkableBlob(ctx, id.Namespace, id.ReadScopes, m.blake3)
 	if err != nil {
 		s.log.Error("link lookup", "err", err)
 		writeErr(w, http.StatusInternalServerError, "lookup failed")
@@ -233,6 +239,14 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity)
 	}
 	if r.ContentLength != m.size {
 		writeErr(w, http.StatusBadRequest, "Content-Length must equal "+api.HeaderSize)
+		return
+	}
+	select {
+	case s.uploadSlots <- struct{}{}:
+		defer func() { <-s.uploadSlots }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusServiceUnavailable, "too many concurrent uploads")
 		return
 	}
 	ctx := r.Context()
@@ -272,14 +286,24 @@ func (s *Server) storeBlob(ctx context.Context, id *Identity, m *putMeta, info B
 	if !errors.Is(err, errBlobGone) {
 		return err
 	}
-	var inline []byte
-	var upload func() error
 	if sp.mem != nil {
-		inline = sp.mem
-	} else {
-		upload = func() error { return s.blobs.Put(ctx, info.Hash, sp.file, info.Size) }
+		return s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, sp.mem, 0)
 	}
-	return s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, inline, upload)
+	// The lease keeps GC from deleting the object between the S3 write and
+	// the row insert, without holding a transaction open during the upload.
+	lease, err := s.store.StartUpload(ctx, info.Hash)
+	if err != nil {
+		return err
+	}
+	if err := s.blobs.Put(ctx, info.Hash, sp.file, info.Size); err != nil {
+		s.store.EndUpload(context.WithoutCancel(ctx), lease) //nolint:errcheck
+		return err
+	}
+	if err := s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, nil, lease); err != nil {
+		s.store.EndUpload(context.WithoutCancel(ctx), lease) //nolint:errcheck
+		return err
+	}
+	return nil
 }
 
 // spooled is a fully received and hashed request body.

@@ -88,7 +88,10 @@ func run() error {
 		Addr:              cfg.Listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       cfg.Storage.RequestTimeout,
+		WriteTimeout:      cfg.Storage.RequestTimeout,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
 	}
 	errc := make(chan error, 1)
 	go func() {

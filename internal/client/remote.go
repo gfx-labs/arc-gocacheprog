@@ -175,6 +175,14 @@ func (r *Remote) Whoami(ctx context.Context) (*api.Identity, error) {
 
 // IsAuthError reports whether err is a 401 or 403 from the server.
 func IsAuthError(err error) bool {
+	c := statusOf(err)
+	return c == http.StatusUnauthorized || c == http.StatusForbidden
+}
+
+func statusOf(err error) int {
 	var se *StatusError
-	return errors.As(err, &se) && (se.Code == http.StatusUnauthorized || se.Code == http.StatusForbidden)
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	return 0
 }

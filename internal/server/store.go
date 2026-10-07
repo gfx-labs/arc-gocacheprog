@@ -147,15 +147,16 @@ type BlobInfo struct {
 	Size   int64
 }
 
-// NamespaceHasBlob reports whether namespace already references blob hash.
-// Linking is limited to these blobs so a client cannot read content it never
-// possessed by guessing a hash.
-func (s *Store) NamespaceHasBlob(ctx context.Context, namespace string, hash []byte) (*BlobInfo, error) {
+// LinkableBlob returns blob metadata when an entry in one of scopes of
+// namespace already references the blob. Linking is limited to these so a
+// token cannot obtain content it could not already read by knowing hashes.
+func (s *Store) LinkableBlob(ctx context.Context, namespace string, scopes []string, hash []byte) (*BlobInfo, error) {
 	var b BlobInfo
 	err := s.pool.QueryRow(ctx, `
 		SELECT b.hash, b.sha256, b.size FROM blobs b
-		WHERE b.hash = $2 AND EXISTS (SELECT 1 FROM entries e WHERE e.namespace = $1 AND e.blob_hash = $2)`,
-		namespace, hash).Scan(&b.Hash, &b.SHA256, &b.Size)
+		WHERE b.hash = $3 AND EXISTS (
+			SELECT 1 FROM entries e WHERE e.namespace = $1 AND e.scope = ANY($2) AND e.blob_hash = $3)`,
+		namespace, scopes, hash).Scan(&b.Hash, &b.SHA256, &b.Size)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -165,10 +166,10 @@ func (s *Store) NamespaceHasBlob(ctx context.Context, namespace string, hash []b
 // errBlobGone signals that a blob row vanished (collected) between checks.
 var errBlobGone = errors.New("blob row is gone")
 
-// LinkExisting creates or replaces an entry pointing at an existing blob. It
-// bumps the blob's access time inside the transaction, which serializes with
-// GC: if GC holds the row it waits, then sees the row gone and returns
-// errBlobGone so the caller can upload instead.
+// LinkExisting creates or replaces an entry pointing at an existing blob. The
+// UPDATE takes the blob row lock, which serializes with GC: if GC holds the
+// row it waits, then sees the row gone and returns errBlobGone so the caller
+// can upload instead.
 func (s *Store) LinkExisting(ctx context.Context, namespace, scope string, actionID, outputID []byte, b BlobInfo) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE blobs SET accessed_at = now() WHERE hash = $1`, b.Hash)
@@ -182,24 +183,34 @@ func (s *Store) LinkExisting(ctx context.Context, namespace, scope string, actio
 	})
 }
 
-// hashLockSQL is the advisory lock key for a blob hash. Uploads hold it
-// shared while writing the object and row, GC holds it exclusive while
-// deleting either.
-const hashLockKey = "hashtextextended(encode($1::bytea, 'hex'), 0)"
-
-// InsertBlob records a blob and the entry that points at it. upload, if not
-// nil, writes the object to S3 while the per-hash shared lock is held so GC
-// cannot delete it between the write and the row insert.
-func (s *Store) InsertBlob(ctx context.Context, namespace, scope string, actionID, outputID []byte, b BlobInfo, inline []byte, upload func() error) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared("+hashLockKey+")", b.Hash); err != nil {
+// StartUpload records a lease for an upload of hash. GC does not delete S3
+// objects for hashes with a live lease. The lease is removed by InsertBlob or
+// EndUpload.
+func (s *Store) StartUpload(ctx context.Context, hash []byte) (int64, error) {
+	var id int64
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Waits for a GC delete of this hash's object to finish.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared("+hashLockKey+")", hash); err != nil {
 			return err
 		}
-		if upload != nil {
-			if err := upload(); err != nil {
-				return err
-			}
-		}
+		return tx.QueryRow(ctx, `INSERT INTO upload_leases (hash) VALUES ($1) RETURNING id`, hash).Scan(&id)
+	})
+	return id, err
+}
+
+// hashLockKey is the advisory lock key expression for a blob hash.
+const hashLockKey = "hashtextextended(encode($1::bytea, 'hex'), 0)"
+
+// EndUpload removes a lease after a failed upload.
+func (s *Store) EndUpload(ctx context.Context, lease int64) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM upload_leases WHERE id = $1`, lease)
+	return err
+}
+
+// InsertBlob records a blob and the entry that points at it, and releases
+// the upload lease if one is given.
+func (s *Store) InsertBlob(ctx context.Context, namespace, scope string, actionID, outputID []byte, b BlobInfo, inline []byte, lease int64) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var data any
 		if inline != nil {
 			data = inline
@@ -210,8 +221,23 @@ func (s *Store) InsertBlob(ctx context.Context, namespace, scope string, actionI
 			b.Hash, b.SHA256, b.Size, data); err != nil {
 			return err
 		}
+		if lease != 0 {
+			if _, err := tx.Exec(ctx, `DELETE FROM upload_leases WHERE id = $1`, lease); err != nil {
+				return err
+			}
+		}
 		return upsertEntry(ctx, tx, namespace, scope, actionID, outputID, b)
 	})
+}
+
+// BlobIsInline reports whether the blob row stores its data inline.
+func (s *Store) BlobIsInline(ctx context.Context, hash []byte) (bool, error) {
+	var inline bool
+	err := s.pool.QueryRow(ctx, `SELECT inline_data IS NOT NULL FROM blobs WHERE hash = $1`, hash).Scan(&inline)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return inline, err
 }
 
 func upsertEntry(ctx context.Context, tx pgx.Tx, namespace, scope string, actionID, outputID []byte, b BlobInfo) error {

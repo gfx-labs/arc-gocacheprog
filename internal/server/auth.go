@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 )
@@ -140,44 +141,88 @@ type ghaAuth struct {
 	cfg GHAConfig
 
 	mu   sync.Mutex
-	keys oidc.KeySet
+	sets map[string]*keySetEntry // by issuer
 }
+
+type keySetEntry struct {
+	mu       sync.Mutex
+	keys     oidc.KeySet
+	lastErr  error
+	failedAt time.Time
+}
+
+const (
+	discoveryTimeout = 10 * time.Second
+	discoveryBackoff = 30 * time.Second
+)
 
 func newGHAAuth(cfg GHAConfig) *ghaAuth {
-	return &ghaAuth{cfg: cfg}
+	return &ghaAuth{cfg: cfg, sets: map[string]*keySetEntry{}}
 }
 
-// keySet returns the JWKS for the configured issuer. The JWKS URL is
-// discovered from the issuer (custom enterprise issuers serve JWKS at a
-// different path) unless jwks_url overrides it. Discovery failures are not
-// cached so a GitHub outage at startup is not fatal.
-func (g *ghaAuth) keySet(ctx context.Context) (oidc.KeySet, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.keys != nil {
-		return g.keys, nil
+// jwksURL returns the configured JWKS override for issuer, if any.
+func (g *ghaAuth) jwksURL(issuer string) string {
+	if issuer == g.cfg.Issuer {
+		return g.cfg.JWKSURL
 	}
-	bg := context.WithoutCancel(ctx)
-	url := g.cfg.JWKSURL
-	if url == "" {
-		p, err := oidc.NewProvider(bg, g.cfg.Issuer)
-		if err != nil {
-			return nil, fmt.Errorf("oidc discovery for %s: %w", g.cfg.Issuer, err)
-		}
-		var meta struct {
-			JWKSURI string `json:"jwks_uri"`
-		}
-		if err := p.Claims(&meta); err != nil || meta.JWKSURI == "" {
-			return nil, fmt.Errorf("oidc discovery for %s: no jwks_uri", g.cfg.Issuer)
-		}
-		url = meta.JWKSURI
-	}
-	g.keys = oidc.NewRemoteKeySet(bg, url)
-	return g.keys, nil
+	return g.cfg.RuntimeTokenJWKSURL
 }
+
+// keySet returns the JWKS for issuer. The JWKS URL comes from OIDC discovery
+// (custom enterprise issuers serve JWKS at a different path) unless an
+// override is configured. Discovery is bounded by a timeout and failures are
+// cached briefly so a GitHub outage does not stall every request.
+func (g *ghaAuth) keySet(ctx context.Context, issuer string) (oidc.KeySet, error) {
+	g.mu.Lock()
+	e, ok := g.sets[issuer]
+	if !ok {
+		e = &keySetEntry{}
+		g.sets[issuer] = e
+	}
+	g.mu.Unlock()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.keys != nil {
+		return e.keys, nil
+	}
+	if e.lastErr != nil && time.Since(e.failedAt) < discoveryBackoff {
+		return nil, e.lastErr
+	}
+	url := g.jwksURL(issuer)
+	if url == "" {
+		if !strings.HasPrefix(issuer, "https://") && !strings.HasPrefix(issuer, "http://") {
+			return nil, fmt.Errorf("issuer %q is not a URL; set a jwks url for it", issuer)
+		}
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discoveryTimeout)
+		defer cancel()
+		p, err := oidc.NewProvider(oidc.ClientContext(dctx, httpClient), issuer)
+		if err == nil {
+			var meta struct {
+				JWKSURI string `json:"jwks_uri"`
+			}
+			if cerr := p.Claims(&meta); cerr != nil || meta.JWKSURI == "" {
+				err = fmt.Errorf("no jwks_uri")
+			}
+			url = meta.JWKSURI
+		}
+		if err != nil {
+			e.lastErr = fmt.Errorf("oidc discovery for %s: %w", issuer, err)
+			e.failedAt = time.Now()
+			return nil, e.lastErr
+		}
+	}
+	// The key set refreshes on unknown kids using this context's client.
+	e.keys = oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), httpClient), url)
+	e.lastErr = nil
+	return e.keys, nil
+}
+
+// httpClient bounds JWKS and discovery requests.
+var httpClient = &http.Client{Timeout: discoveryTimeout}
 
 func (g *ghaAuth) verify(ctx context.Context, raw, issuer string, audience bool) (*ghaClaims, error) {
-	ks, err := g.keySet(ctx)
+	ks, err := g.keySet(ctx, issuer)
 	if err != nil {
 		return nil, &authError{status: http.StatusServiceUnavailable, msg: err.Error()}
 	}
@@ -239,8 +284,13 @@ func (g *ghaAuth) authenticate(ctx context.Context, raw string) (*Identity, erro
 		Kind:       "gha",
 		Subject:    c.Subject,
 		Namespace:  "gh:" + c.RepositoryID,
-		WriteScope: c.Ref,
 		ReadScopes: []string{c.Ref},
+	}
+	// Only events where ref is the code being built may write. Others, like
+	// pull_request_target, run under the default branch ref and would let
+	// untrusted code write into it.
+	if slices.Contains(g.cfg.WriteEvents, c.EventName) {
+		id.WriteScope = c.Ref
 	}
 	add := func(s string) {
 		if s != "" && !slices.Contains(id.ReadScopes, s) {

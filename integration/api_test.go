@@ -169,7 +169,7 @@ func unsigned(claims map[string]any) string {
 
 func TestRuntimeTokenScopes(t *testing.T) {
 	e := newEnv(t)
-	iss := e.Issuer
+	iss := e.RuntimeIssuer
 	rt := func(ac string) *client.Remote {
 		return remote(e, iss.sign(t, map[string]any{
 			"aud":           "vstoken.actions.githubusercontent.com|vso:abc",
@@ -180,7 +180,7 @@ func TestRuntimeTokenScopes(t *testing.T) {
 	}
 	feat := rt(`[{"Scope":"refs/heads/feature","Permission":3},{"Scope":"refs/heads/main","Permission":1}]`)
 	main := rt(`[{"Scope":"refs/heads/main","Permission":3}]`)
-	oidcFeat := remote(e, iss.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/feature", nil)))
+	oidcFeat := remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/feature", nil)))
 
 	b := newBlob(t, 10)
 	if err := put(t, main, action("x"), b); err != nil {
@@ -198,6 +198,57 @@ func TestRuntimeTokenScopes(t *testing.T) {
 	}
 	if got, _ := get(t, main, action("y")); got != nil {
 		t.Fatal("main read feature write")
+	}
+	// A runtime-style token signed by the OIDC issuer's key is rejected
+	// because it claims the runtime issuer.
+	forged := e.Issuer.sign(t, map[string]any{"iss": iss.URL(), "repository_id": "100", "ac": `[{"Scope":"refs/heads/main","Permission":3}]`})
+	if err := put(t, remote(e, forged), action("z"), b); statusCode(err) != 401 {
+		t.Fatalf("runtime token signed with wrong issuer key: expected 401, got %v", err)
+	}
+}
+
+func TestEventWritePolicy(t *testing.T) {
+	e := newEnv(t)
+	b := newBlob(t, 10)
+	for _, ev := range []string{"pull_request_target", "workflow_run", "issue_comment"} {
+		r := remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/main", map[string]any{"event_name": ev})))
+		if err := put(t, r, action(ev), b); statusCode(err) != 403 {
+			t.Fatalf("%s write: expected 403, got %v", ev, err)
+		}
+		if _, err := get(t, r, action(ev)); err != nil {
+			t.Fatalf("%s read: %v", ev, err)
+		}
+	}
+	for _, ev := range []string{"push", "pull_request", "merge_group"} {
+		r := remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/main", map[string]any{"event_name": ev})))
+		if err := put(t, r, action(ev), b); err != nil {
+			t.Fatalf("%s write: %v", ev, err)
+		}
+	}
+}
+
+func TestLinkRequiresReadableScope(t *testing.T) {
+	e := newEnv(t)
+	tok := func(ref string) *client.Remote {
+		return remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", ref, nil)))
+	}
+	featA, featB, main := tok("refs/heads/a"), tok("refs/heads/b"), tok("refs/heads/main")
+	b := newBlob(t, 4096)
+	if err := put(t, featA, action("x"), b); err != nil {
+		t.Fatal(err)
+	}
+	// Branch b cannot read branch a, so it may not link to a's content.
+	ok, err := featB.Link(context.Background(), action("y"), b.sha256, b.blake3, int64(len(b.data)))
+	if err != nil || ok {
+		t.Fatalf("link from unreadable scope: ok=%v err=%v", ok, err)
+	}
+	// Once main has it, every branch can link to it.
+	if err := put(t, main, action("m"), b); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = featB.Link(context.Background(), action("y"), b.sha256, b.blake3, int64(len(b.data)))
+	if err != nil || !ok {
+		t.Fatalf("link from main scope: ok=%v err=%v", ok, err)
 	}
 }
 

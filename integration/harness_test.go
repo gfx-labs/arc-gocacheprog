@@ -207,6 +207,8 @@ func indexByte(s string, b byte) int {
 type env struct {
 	URL    string
 	Issuer *fakeIssuer
+	// RuntimeIssuer signs ACTIONS_RUNTIME_TOKEN style tokens with its own keys.
+	RuntimeIssuer *fakeIssuer
 	Store  *server.Store
 	Blobs  *server.BlobStore
 	Config server.Config
@@ -219,6 +221,7 @@ func newEnv(t testing.TB, mutate ...func(*server.Config)) *env {
 	t.Helper()
 	ctx := context.Background()
 	iss := newFakeIssuer(t)
+	rtIss := newFakeIssuer(t)
 
 	cfg := server.DefaultConfig()
 	cfg.DatabaseURL = newDatabase(t)
@@ -230,7 +233,8 @@ func newEnv(t testing.TB, mutate ...func(*server.Config)) *env {
 		Issuer:             iss.URL(),
 		AllowedOwners:      []string{"gfx-labs"},
 		DefaultRefs:        []string{"main"},
-		AcceptRuntimeToken: true,
+		AcceptRuntimeToken:  true,
+		RuntimeTokenIssuers: []string{rtIss.URL()},
 	}
 	cfg.Auth.Static = []server.StaticKey{{
 		Name: "local", Key: testKey, Namespace: "local", WriteScope: "dev",
@@ -273,7 +277,7 @@ func newEnv(t testing.TB, mutate ...func(*server.Config)) *env {
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
 	return &env{
-		URL: hs.URL, Issuer: iss, Store: store, Blobs: blobs, Config: cfg,
+		URL: hs.URL, Issuer: iss, RuntimeIssuer: rtIss, Store: store, Blobs: blobs, Config: cfg,
 		GC: server.NewGC(cfg.GC, store, blobs, log),
 	}
 }

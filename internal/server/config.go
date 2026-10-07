@@ -39,6 +39,10 @@ type Storage struct {
 	TouchInterval time.Duration `yaml:"touch_interval"`
 	// TempDir spools large uploads while they are hashed. Empty uses os.TempDir.
 	TempDir string `yaml:"temp_dir"`
+	// MaxConcurrentUploads bounds parallel PUTs. Excess requests get 503.
+	MaxConcurrentUploads int `yaml:"max_concurrent_uploads"`
+	// RequestTimeout bounds reading a request and writing a response.
+	RequestTimeout time.Duration `yaml:"request_timeout"`
 }
 
 type GCConfig struct {
@@ -54,6 +58,9 @@ type GCConfig struct {
 	NamespaceMaxBytes int64 `yaml:"namespace_max_bytes"`
 	// OrphanSweep lists the bucket and removes objects with no blob row.
 	OrphanSweep bool `yaml:"orphan_sweep"`
+	// UploadLease is how long an in-progress upload protects its object from
+	// GC. Must exceed the longest upload. Expired leases are removed.
+	UploadLease time.Duration `yaml:"upload_lease"`
 }
 
 type Auth struct {
@@ -77,11 +84,18 @@ type GHAConfig struct {
 	// DefaultRefs are readable fallbacks for every ref, in order, like the
 	// default branch in actions/cache.
 	DefaultRefs []string `yaml:"default_refs"`
+	// WriteEvents lists the event_name values whose tokens may write. Other
+	// events get read-only access. Events like pull_request_target,
+	// workflow_run and issue_comment run with the default branch as ref while
+	// often building untrusted code, so they are excluded by default.
+	WriteEvents []string `yaml:"write_events"`
 	// AcceptRuntimeToken accepts ACTIONS_RUNTIME_TOKEN (scopes from the "ac" claim).
 	AcceptRuntimeToken bool `yaml:"accept_runtime_token"`
 	// RuntimeTokenIssuers is the set of issuers accepted for runtime tokens.
-	// Empty means only Issuer.
+	// Empty means only Issuer. Runtime tokens are verified with the issuer's
+	// JWKS unless RuntimeTokenJWKSURL is set.
 	RuntimeTokenIssuers []string `yaml:"runtime_token_issuers"`
+	RuntimeTokenJWKSURL string   `yaml:"runtime_token_jwks_url"`
 }
 
 type StaticKey struct {
@@ -104,14 +118,19 @@ func DefaultConfig() Config {
 		},
 		Storage: Storage{
 			InlineMaxBytes: 32 << 10,
-			MaxBlobBytes:   4 << 30,
-			TouchInterval:  time.Hour,
+			MaxBlobBytes:         1 << 30,
+			TouchInterval:        time.Hour,
+			MaxConcurrentUploads: 32,
+			RequestTimeout:       15 * time.Minute,
 		},
 		GC: GCConfig{
 			Enabled:   true,
 			Interval:  time.Hour,
 			EntryTTL:  7 * 24 * time.Hour,
-			BlobGrace: 6 * time.Hour,
+			BlobGrace:         6 * time.Hour,
+			NamespaceMaxBytes: 20 << 30,
+			OrphanSweep:       true,
+			UploadLease:       time.Hour,
 		},
 	}
 }
@@ -146,6 +165,9 @@ func (c *Config) Validate() error {
 		if g.Audience == "" {
 			g.Audience = "arc-gocacheprog"
 		}
+		if g.WriteEvents == nil {
+			g.WriteEvents = DefaultWriteEvents
+		}
 		if !g.AllowAnyOwner && len(g.AllowedOwners) == 0 && len(g.AllowedRepositories) == 0 {
 			return fmt.Errorf("auth.gha needs allowed_owners, allowed_repositories, or allow_any_owner: true")
 		}
@@ -164,8 +186,18 @@ func (c *Config) Validate() error {
 	if c.Storage.InlineMaxBytes < 0 {
 		return fmt.Errorf("storage.inline_max_bytes must be >= 0")
 	}
+	if c.Storage.MaxConcurrentUploads <= 0 {
+		return fmt.Errorf("storage.max_concurrent_uploads must be > 0")
+	}
+	if c.GC.UploadLease > 0 && c.GC.UploadLease < c.Storage.RequestTimeout {
+		return fmt.Errorf("gc.upload_lease must be >= storage.request_timeout")
+	}
 	if c.GC.Enabled && c.GC.Interval <= 0 {
 		return fmt.Errorf("gc.interval must be > 0")
 	}
 	return nil
 }
+
+// DefaultWriteEvents are the events that may write by default. In each of
+// them the token's ref is the code being built.
+var DefaultWriteEvents = []string{"push", "pull_request", "merge_group", "workflow_dispatch", "schedule"}

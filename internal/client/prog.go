@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -448,8 +449,16 @@ func (p *Prog) doUpload(u upload) error {
 		p.Stats.Linked.Add(1)
 		return nil
 	}
-	if err := p.opts.Remote.Put(ctx, u.actionID, u.outputID, u.blake3, u.size, u.path); err != nil {
-		return err
+	var perr error
+	for attempt := range 4 {
+		perr = p.opts.Remote.Put(ctx, u.actionID, u.outputID, u.blake3, u.size, u.path)
+		if statusOf(perr) != http.StatusServiceUnavailable {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	if perr != nil {
+		return perr
 	}
 	p.Stats.Uploads.Add(1)
 	p.Stats.BytesUp.Add(u.size)

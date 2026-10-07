@@ -84,6 +84,26 @@ func TestGC(t *testing.T) {
 		t.Fatalf("expected 1 orphan, got %+v", st)
 	}
 
+	// Objects with a live upload lease are not swept even without a row.
+	leased := newBlob(t, 4096)
+	os.WriteFile(f, leased.data, 0o644) //nolint:errcheck
+	fh, _ = os.Open(f)
+	lease, err := e.Store.StartUpload(ctx, leased.blake3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Blobs.Put(ctx, leased.blake3, fh, int64(len(leased.data))); err != nil {
+		t.Fatal(err)
+	}
+	fh.Close()
+	if st, err = gcNow.Run(ctx); err != nil || st.OrphanObjects != 0 {
+		t.Fatalf("leased object swept: %+v %v", st, err)
+	}
+	e.Store.EndUpload(ctx, lease) //nolint:errcheck
+	if st, err = gcNow.Run(ctx); err != nil || st.OrphanObjects != 1 {
+		t.Fatalf("object not swept after lease ended: %+v %v", st, err)
+	}
+
 	// Quota eviction keeps the most recently used entries.
 	gcQuota := server.NewGC(server.GCConfig{NamespaceMaxBytes: 9000, BlobGrace: time.Hour}, e.Store, e.Blobs, nil)
 	if _, err := pool.Exec(ctx, `UPDATE entries SET accessed_at = now() - interval '1 hour' WHERE action_id = $1`, action("shared2")); err != nil {

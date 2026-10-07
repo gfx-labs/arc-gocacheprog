@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"time"
@@ -92,6 +93,9 @@ func (g *GC) Run(ctx context.Context) (GCStats, error) {
 			return st, fmt.Errorf("evict: %w", err)
 		}
 	}
+	if err := g.expireLeases(ctx); err != nil {
+		return st, fmt.Errorf("expire leases: %w", err)
+	}
 	if err := g.deleteUnreferencedBlobs(ctx, &st); err != nil {
 		return st, fmt.Errorf("delete blobs: %w", err)
 	}
@@ -141,16 +145,22 @@ func (g *GC) evictOverQuota(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
-// deleteUnreferencedBlobs removes blobs no entry points at and that have not
-// been touched within the grace period. Each candidate is locked FOR UPDATE.
-// Uploads that dedup against a blob update its accessed_at under the same row
-// lock, so they either finish first (and the recheck on accessed_at skips the
-// row) or wait and then see the row gone and upload again.
+// deleteUnreferencedBlobs removes blob rows no entry points at that have not
+// been touched within the grace period, then deletes their S3 objects after
+// the row deletion commits. Linking a blob takes its row lock, so a link
+// either commits first (and the NOT EXISTS recheck keeps the row) or waits
+// and then sees the row gone and uploads again under a lease.
 func (g *GC) deleteUnreferencedBlobs(ctx context.Context, st *GCStats) error {
 	cutoff := g.now().Add(-g.cfg.BlobGrace)
 	for {
-		n := 0
+		type cand struct {
+			hash   []byte
+			size   int64
+			inline bool
+		}
+		var deleted []cand
 		err := pgx.BeginFunc(ctx, g.store.pool, func(tx pgx.Tx) error {
+			deleted = deleted[:0]
 			rows, err := tx.Query(ctx, `
 				SELECT b.hash, b.size, b.inline_data IS NOT NULL FROM blobs b
 				WHERE b.accessed_at < $1
@@ -160,63 +170,86 @@ func (g *GC) deleteUnreferencedBlobs(ctx context.Context, st *GCStats) error {
 			if err != nil {
 				return err
 			}
-			type cand struct {
-				hash   []byte
-				size   int64
-				inline bool
-			}
-			var cands []cand
-			for rows.Next() {
+			cands, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (cand, error) {
 				var c cand
-				if err := rows.Scan(&c.hash, &c.size, &c.inline); err != nil {
-					return err
-				}
-				cands = append(cands, c)
-			}
-			if err := rows.Err(); err != nil {
+				err := r.Scan(&c.hash, &c.size, &c.inline)
+				return c, err
+			})
+			if err != nil {
 				return err
 			}
 			for _, c := range cands {
-				// Skip hashes an upload is writing right now. Try-lock so we
-				// never wait while holding row locks.
-				var got bool
-				if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock("+hashLockKey+")", c.hash).Scan(&got); err != nil {
-					return err
-				}
-				if !got {
-					continue
-				}
 				tag, err := tx.Exec(ctx, `DELETE FROM blobs b WHERE b.hash = $1
 					AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.blob_hash = b.hash)`, c.hash)
 				if err != nil {
 					return err
 				}
-				if tag.RowsAffected() == 0 {
-					continue
+				if tag.RowsAffected() == 1 {
+					deleted = append(deleted, c)
 				}
-				if !c.inline {
-					if err := g.blobs.Delete(ctx, c.hash); err != nil {
-						return err
-					}
-				}
-				n++
-				st.DeletedBlobs++
-				st.DeletedBytes += c.size
 			}
 			return nil
 		})
 		if err != nil {
 			return err
 		}
-		if n < gcBatch {
+		for _, c := range deleted {
+			st.DeletedBlobs++
+			st.DeletedBytes += c.size
+			if c.inline {
+				continue
+			}
+			// If this fails the object becomes an orphan for the sweep.
+			if _, err := g.deleteObjectIfUnowned(ctx, c.hash); err != nil {
+				g.log.Warn("delete object", "hash", hex.EncodeToString(c.hash), "err", err)
+			}
+		}
+		if len(deleted) < gcBatch {
 			return nil
 		}
 	}
 }
 
+// deleteObjectIfUnowned deletes the S3 object for hash when no blob row and
+// no live upload lease exist. The exclusive per-hash advisory lock blocks
+// StartUpload for the duration of the check and delete, so an upload either
+// registers its lease first (and we skip) or starts after the delete.
+func (g *GC) deleteObjectIfUnowned(ctx context.Context, hash []byte) (bool, error) {
+	deleted := false
+	err := pgx.BeginFunc(ctx, g.store.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock("+hashLockKey+")", hash); err != nil {
+			return err
+		}
+		var owned bool
+		if err := tx.QueryRow(ctx, `SELECT
+			EXISTS (SELECT 1 FROM blobs WHERE hash = $1) OR
+			EXISTS (SELECT 1 FROM upload_leases WHERE hash = $1)`, hash).Scan(&owned); err != nil {
+			return err
+		}
+		if owned {
+			return nil
+		}
+		if err := g.blobs.Delete(ctx, hash); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
+	})
+	return deleted, err
+}
+
+// expireLeases removes leases of uploads that died without cleaning up.
+func (g *GC) expireLeases(ctx context.Context) error {
+	if g.cfg.UploadLease <= 0 {
+		return nil
+	}
+	_, err := g.store.pool.Exec(ctx, `DELETE FROM upload_leases WHERE started_at < $1`, g.now().Add(-g.cfg.UploadLease))
+	return err
+}
+
 // sweepOrphans deletes S3 objects that have no blob row and are older than
 // the grace period. These come from uploads that failed between the S3 put
-// and the metadata insert.
+// and the metadata insert, or from failed deletes.
 func (g *GC) sweepOrphans(ctx context.Context) (int64, error) {
 	cutoff := g.now().Add(-g.cfg.BlobGrace)
 	var deleted int64
@@ -244,27 +277,12 @@ func (g *GC) sweepOrphans(ctx context.Context) (int64, error) {
 			return err
 		}
 		for _, h := range missing {
-			err := pgx.BeginFunc(ctx, g.store.pool, func(tx pgx.Tx) error {
-				// An upload holding the shared lock may be about to insert the row.
-				var got bool
-				if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock("+hashLockKey+")", h).Scan(&got); err != nil {
-					return err
-				}
-				if !got {
-					return nil
-				}
-				var exists bool
-				if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash=$1)", h).Scan(&exists); err != nil {
-					return err
-				}
-				if exists {
-					return nil
-				}
-				deleted++
-				return g.blobs.Delete(ctx, h)
-			})
+			ok, err := g.deleteObjectIfUnowned(ctx, h)
 			if err != nil {
 				return err
+			}
+			if ok {
+				deleted++
 			}
 		}
 		return nil
