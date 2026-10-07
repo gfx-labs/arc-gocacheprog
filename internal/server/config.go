@@ -1,7 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -126,16 +129,16 @@ func DefaultConfig() Config {
 			Prefix: "gocache/",
 		},
 		Storage: Storage{
-			InlineMaxBytes: 32 << 10,
+			InlineMaxBytes:       32 << 10,
 			MaxBlobBytes:         1 << 30,
 			TouchInterval:        time.Hour,
 			MaxConcurrentUploads: 32,
 			RequestTimeout:       15 * time.Minute,
 		},
 		GC: GCConfig{
-			Enabled:   true,
-			Interval:  time.Hour,
-			EntryTTL:  7 * 24 * time.Hour,
+			Enabled:           true,
+			Interval:          time.Hour,
+			EntryTTL:          7 * 24 * time.Hour,
 			BlobGrace:         6 * time.Hour,
 			NamespaceMaxBytes: 20 << 30,
 			OrphanSweep:       true,
@@ -151,8 +154,14 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 	expanded := os.ExpandEnv(string(raw))
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader([]byte(expanded)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&cfg); err != nil {
 		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return cfg, fmt.Errorf("parse %s: expected a single YAML document", path)
 	}
 	return cfg, cfg.Validate()
 }
@@ -201,14 +210,32 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("auth.static[%d]: write_scope is required unless read_only", i)
 		}
 	}
-	if c.Storage.InlineMaxBytes < 0 {
-		return fmt.Errorf("storage.inline_max_bytes must be >= 0")
+	if c.Storage.MaxBlobBytes <= 0 || c.Storage.MaxBlobBytes == math.MaxInt64 {
+		return fmt.Errorf("storage.max_blob_bytes must be > 0 and < %d", int64(math.MaxInt64))
+	}
+	if c.Storage.InlineMaxBytes < 0 || c.Storage.InlineMaxBytes > c.Storage.MaxBlobBytes {
+		return fmt.Errorf("storage.inline_max_bytes must be >= 0 and <= storage.max_blob_bytes")
+	}
+	if c.Storage.RequestTimeout <= 0 {
+		return fmt.Errorf("storage.request_timeout must be > 0")
+	}
+	if c.Storage.TouchInterval < 0 {
+		return fmt.Errorf("storage.touch_interval must be >= 0")
 	}
 	if c.Storage.MaxConcurrentUploads <= 0 {
 		return fmt.Errorf("storage.max_concurrent_uploads must be > 0")
 	}
-	if c.GC.UploadLease > 0 && c.GC.UploadLease < c.Storage.RequestTimeout {
-		return fmt.Errorf("gc.upload_lease must be >= storage.request_timeout")
+	if c.GC.UploadLease <= 0 || c.GC.UploadLease < c.Storage.RequestTimeout {
+		return fmt.Errorf("gc.upload_lease must be > 0 and >= storage.request_timeout")
+	}
+	if c.GC.BlobGrace < 0 {
+		return fmt.Errorf("gc.blob_grace must be >= 0")
+	}
+	if c.GC.EntryTTL < 0 {
+		return fmt.Errorf("gc.entry_ttl must be >= 0")
+	}
+	if c.GC.NamespaceMaxBytes < 0 {
+		return fmt.Errorf("gc.namespace_max_bytes must be >= 0")
 	}
 	if c.GC.Enabled && c.GC.Interval <= 0 {
 		return fmt.Errorf("gc.interval must be > 0")
