@@ -182,6 +182,9 @@ func (l *Limiter) sweepLocked(now time.Time) {
 func (l *Limiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if wait, ok := l.AdmitRequest(); !ok {
+			if ri := infoFrom(r.Context()); ri != nil {
+				ri.errMsg = "request rate limit"
+			}
 			writeLimited(w, wait, "request rate limit")
 			return
 		}
@@ -194,4 +197,12 @@ func writeLimited(w http.ResponseWriter, wait time.Duration, msg string) {
 	secs := max(int64(math.Ceil(wait.Seconds())), 1)
 	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
 	writeErr(w, http.StatusTooManyRequests, msg)
+}
+
+// limited is writeLimited that also records msg for the access log.
+func (s *Server) limited(w http.ResponseWriter, r *http.Request, wait time.Duration, msg string) {
+	if ri := infoFrom(r.Context()); ri != nil {
+		ri.errMsg = msg
+	}
+	writeLimited(w, wait, msg)
 }

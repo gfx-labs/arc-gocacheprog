@@ -92,6 +92,7 @@ func run() error {
 		WriteTimeout:      cfg.Storage.RequestTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
+		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelError),
 	}
 	errc := make(chan error, 1)
 	go func() {

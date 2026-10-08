@@ -5,6 +5,11 @@
 # Listen address.
 listen: ":8080"
 
+# Log one line per successful request and cache miss at info level. Rejected
+# (4xx) and failed (5xx) requests are always logged, with a request_id that
+# is also returned in the X-Request-Id response header.
+access_log: false
+
 # Postgres connection string. Holds metadata, small blobs and the GC lock.
 # Schema migrations run at startup.
 database_url: ${DATABASE_URL}

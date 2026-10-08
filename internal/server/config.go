@@ -23,6 +23,9 @@ type Config struct {
 	Storage     Storage      `yaml:"storage"`
 	GC          GCConfig     `yaml:"gc"`
 	Limits      LimitsConfig `yaml:"limits"`
+	// AccessLog logs successful requests and cache misses at Info. Without
+	// it they log at Debug. Rejected and failed requests are always logged.
+	AccessLog bool `yaml:"access_log"`
 }
 
 type S3Config struct {

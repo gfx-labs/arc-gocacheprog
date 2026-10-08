@@ -87,7 +87,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+api.PathHealthz, func(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.pool.Ping(r.Context()); err != nil {
-			http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+			s.fail(w, r, http.StatusServiceUnavailable, "db unavailable", err)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -96,21 +96,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+api.PathActions+"{id}", s.authed(s.handleGet))
 	mux.HandleFunc("PUT "+api.PathActions+"{id}", s.authed(s.handlePut))
 	mux.HandleFunc("POST "+api.PathActions+"{id}/link", s.authed(s.handleLink))
+	routed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ri := infoFrom(r.Context()); ri != nil {
+			_, ri.route = mux.Handler(r)
+		}
+		mux.ServeHTTP(w, r)
+	})
 	// Bound backend work explicitly rather than relying on socket deadlines,
 	// and set those too in case the embedding server has none.
 	timeout := s.cfg.Storage.RequestTimeout
 	if timeout <= 0 {
-		return s.limits.Middleware(mux)
+		return s.logRequests(s.limits.Middleware(routed))
 	}
-	return s.limits.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.logRequests(s.limits.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
 		rc.SetReadDeadline(time.Now().Add(timeout)) //nolint:errcheck
 		// Leave time to write the error response after the context expires.
 		rc.SetWriteDeadline(time.Now().Add(timeout + cleanupTimeout)) //nolint:errcheck
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
-		mux.ServeHTTP(w, r.WithContext(ctx))
-	}))
+		routed.ServeHTTP(w, r.WithContext(ctx))
+	})))
 }
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, id *Identity)
@@ -119,25 +125,37 @@ func (s *Server) authed(h authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok, ok := bearer(r)
 		if !ok {
-			writeErr(w, http.StatusUnauthorized, "missing bearer token")
+			s.fail(w, r, http.StatusUnauthorized, "missing bearer token", nil)
 			return
 		}
 		id, err := s.auth.Authenticate(r.Context(), tok)
 		if err != nil {
 			var ae *authError
 			if errors.As(err, &ae) {
-				if ae.status >= 500 {
-					s.log.Error("auth backend error", "err", ae.cause)
-				}
-				writeErr(w, ae.status, ae.msg)
+				addLogAttrs(r, ae.attrs...)
+				s.fail(w, r, ae.status, ae.msg, ae.cause)
 				return
 			}
-			s.log.Error("auth error", "err", err)
-			writeErr(w, http.StatusInternalServerError, "auth error")
+			s.fail(w, r, http.StatusInternalServerError, "auth error", err)
 			return
+		}
+		if ri := infoFrom(r.Context()); ri != nil {
+			ri.identity = id
 		}
 		h(w, r, id)
 	}
+}
+
+// fail sends an error response. msg goes to the client and the access log,
+// cause only to the access log.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, status int, msg string, cause error) {
+	if ri := infoFrom(r.Context()); ri != nil {
+		ri.errMsg = msg
+		if cause != nil {
+			ri.attrs = append(ri.attrs, "cause", cause.Error())
+		}
+	}
+	writeErr(w, status, msg)
 }
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
@@ -157,50 +175,51 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, id *Identi
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity) {
 	actionID, err := api.DecodeID(r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		s.fail(w, r, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 	if len(id.ReadScopes) == 0 {
-		writeErr(w, http.StatusForbidden, "token has no read scopes")
+		s.fail(w, r, http.StatusForbidden, "token has no read scopes", nil)
 		return
 	}
+	addLogAttrs(r, "action_id", hex.EncodeToString(actionID))
 	ctx := r.Context()
 	e, err := s.store.Lookup(ctx, id.Namespace, id.ReadScopes, actionID)
 	if err != nil {
-		s.log.Error("lookup", "err", err)
-		writeErr(w, http.StatusInternalServerError, "lookup failed")
+		s.fail(w, r, http.StatusInternalServerError, "lookup failed", err)
 		return
 	}
 	if e == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	addLogAttrs(r, "hit_scope", e.Scope)
 	var body io.ReadCloser
 	if e.IsInline {
 		body = io.NopCloser(bytes.NewReader(e.Inline))
 	} else {
 		body, err = s.blobs.Get(ctx, e.BlobHash)
 		if errors.Is(err, ErrBlobMissing) {
-			s.log.Warn("blob missing from object store", "hash", hex.EncodeToString(e.BlobHash))
+			log := s.reqLog(r).With("hash", hex.EncodeToString(e.BlobHash))
+			log.Warn("blob missing from object store")
 			dropped, derr := s.store.DropMissingBlob(ctx, e.BlobHash, s.blobs.Exists)
 			if derr != nil {
-				s.log.Error("drop blob", "err", derr)
+				log.Error("drop missing blob", "err", derr)
 			} else if dropped {
-				s.log.Warn("dropped blob and its entries", "hash", hex.EncodeToString(e.BlobHash))
+				log.Warn("dropped blob and its entries")
 			}
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		if err != nil {
-			s.log.Error("blob get", "err", err)
-			writeErr(w, http.StatusBadGateway, "object store error")
+			s.fail(w, r, http.StatusBadGateway, "object store error", err)
 			return
 		}
 	}
 	defer body.Close()
 
 	if err := s.store.Touch(ctx, id.Namespace, e.Scope, actionID, e.BlobHash, s.cfg.Storage.TouchInterval); err != nil {
-		s.log.Warn("touch", "err", err)
+		s.reqLog(r).Warn("touch entry", "err", err)
 	}
 
 	h := w.Header()
@@ -216,7 +235,10 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 	if err != nil || n != e.Size {
 		// Headers are sent. Abort the connection so the client sees a broken
 		// response instead of a short body.
-		s.log.Warn("short or failed body", "hash", hex.EncodeToString(e.BlobHash), "sent", n, "size", e.Size, "err", err)
+		addLogAttrs(r, "hash", hex.EncodeToString(e.BlobHash), "size", e.Size)
+		if err != nil {
+			addLogAttrs(r, "cause", err.Error())
+		}
 		panic(http.ErrAbortHandler)
 	}
 }
@@ -256,23 +278,23 @@ func (s *Server) parsePutMeta(r *http.Request, needHash bool) (*putMeta, error) 
 // clients can skip uploading bodies the server has.
 func (s *Server) handleLink(w http.ResponseWriter, r *http.Request, id *Identity) {
 	if id.WriteScope == "" {
-		writeErr(w, http.StatusForbidden, "token has no write scope")
+		s.fail(w, r, http.StatusForbidden, "token has no write scope", nil)
 		return
 	}
 	m, err := s.parsePutMeta(r, true)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		s.fail(w, r, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
+	addLogAttrs(r, "action_id", hex.EncodeToString(m.actionID), "size", m.size)
 	if wait, ok := s.limits.AdmitWrite(id.Namespace, 0); !ok {
-		writeLimited(w, wait, "write rate limit")
+		s.limited(w, r, wait, "write rate limit")
 		return
 	}
 	ctx := r.Context()
 	b, err := s.store.LinkableBlob(ctx, id.Namespace, id.ReadScopes, m.blake3)
 	if err != nil {
-		s.log.Error("link lookup", "err", err)
-		writeErr(w, http.StatusInternalServerError, "lookup failed")
+		s.fail(w, r, http.StatusInternalServerError, "lookup failed", err)
 		return
 	}
 	if b == nil || b.Size != m.size || !bytes.Equal(b.SHA256, m.outputID) {
@@ -285,8 +307,7 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request, id *Identity
 		return
 	}
 	if err != nil {
-		s.log.Error("link", "err", err)
-		writeErr(w, http.StatusInternalServerError, "link failed")
+		s.fail(w, r, http.StatusInternalServerError, "link failed", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -294,26 +315,27 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request, id *Identity
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity) {
 	if id.WriteScope == "" {
-		writeErr(w, http.StatusForbidden, "token has no write scope")
+		s.fail(w, r, http.StatusForbidden, "token has no write scope", nil)
 		return
 	}
 	m, err := s.parsePutMeta(r, false)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		s.fail(w, r, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
+	addLogAttrs(r, "action_id", hex.EncodeToString(m.actionID), "size", m.size)
 	if r.ContentLength != m.size {
-		writeErr(w, http.StatusBadRequest, "Content-Length must equal "+api.HeaderSize)
+		s.fail(w, r, http.StatusBadRequest, "Content-Length must equal "+api.HeaderSize, nil)
 		return
 	}
 	if wait, ok := s.limits.AdmitWrite(id.Namespace, m.size); !ok {
-		writeLimited(w, wait, "write rate limit")
+		s.limited(w, r, wait, "write rate limit")
 		return
 	}
 	release, ok := s.uploads.acquire(id.Namespace)
 	if !ok {
 		w.Header().Set("Retry-After", "5")
-		writeErr(w, http.StatusServiceUnavailable, "too many concurrent uploads")
+		s.fail(w, r, http.StatusServiceUnavailable, "too many concurrent uploads", nil)
 		return
 	}
 	defer release()
@@ -323,12 +345,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity)
 	sp, err := s.spool(body, m.size)
 	var de *diskError
 	if errors.As(err, &de) {
-		s.log.Error("spool upload", "err", err)
-		writeErr(w, http.StatusInternalServerError, "store failed")
+		s.fail(w, r, http.StatusInternalServerError, "store failed", fmt.Errorf("spool upload: %w", err))
 		return
 	}
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
+		s.fail(w, r, http.StatusBadRequest, "read body: "+err.Error(), nil)
 		return
 	}
 	defer sp.cleanup()
@@ -336,18 +357,17 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity)
 	// cmd/go defines OutputID as the sha256 of the body. Enforcing it means a
 	// token can only map actions to content it actually sent.
 	if !bytes.Equal(sp.sha256, m.outputID) {
-		writeErr(w, http.StatusBadRequest, "body sha256 does not match output id")
+		s.fail(w, r, http.StatusBadRequest, "body sha256 does not match output id", nil)
 		return
 	}
 	if m.blake3 != nil && !bytes.Equal(sp.blake3, m.blake3) {
-		writeErr(w, http.StatusBadRequest, "body blake3 does not match header")
+		s.fail(w, r, http.StatusBadRequest, "body blake3 does not match header", nil)
 		return
 	}
 	info := BlobInfo{Hash: sp.blake3, SHA256: sp.sha256, Size: sp.size}
 
 	if err := s.storeBlob(ctx, id, m, info, sp); err != nil {
-		s.log.Error("store", "err", err)
-		writeErr(w, http.StatusInternalServerError, "store failed")
+		s.fail(w, r, http.StatusInternalServerError, "store failed", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

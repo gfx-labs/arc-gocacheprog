@@ -7,8 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -34,17 +34,25 @@ func (i *Identity) CanRead(scope string) bool { return slices.Contains(i.ReadSco
 type authError struct {
 	status int
 	msg    string
-	// cause is logged but not sent to the client.
+	// cause and attrs are logged but not sent to the client.
 	cause error
+	attrs []any
 }
 
 func (e *authError) Error() string { return e.msg }
 
-func unauthorized(format string, a ...any) error {
+// because records the underlying reason and log attributes.
+func (e *authError) because(cause error, attrs ...any) *authError {
+	e.cause = cause
+	e.attrs = attrs
+	return e
+}
+
+func unauthorized(format string, a ...any) *authError {
 	return &authError{status: http.StatusUnauthorized, msg: fmt.Sprintf(format, a...)}
 }
 
-func forbidden(format string, a ...any) error {
+func forbidden(format string, a ...any) *authError {
 	return &authError{status: http.StatusForbidden, msg: fmt.Sprintf(format, a...)}
 }
 
@@ -254,13 +262,11 @@ func (g *ghaAuth) verify(ctx context.Context, raw, issuer string, audience bool)
 	})
 	tok, err := v.Verify(ctx, raw)
 	if err != nil {
-		slog.Debug("token verification failed", "err", err)
-		return nil, unauthorized("invalid token")
+		return nil, unauthorized("invalid token").because(err)
 	}
 	var c ghaClaims
 	if err := tok.Claims(&c); err != nil {
-		slog.Debug("token claims invalid", "err", err)
-		return nil, unauthorized("invalid token")
+		return nil, unauthorized("invalid token").because(fmt.Errorf("claims: %w", err))
 	}
 	return &c, nil
 }
@@ -288,13 +294,18 @@ type acScope struct {
 func (g *ghaAuth) authenticate(ctx context.Context, raw string) (*Identity, error) {
 	unverified, err := parseUnverified(raw)
 	if err != nil {
-		return nil, unauthorized("invalid token")
+		return nil, unauthorized("invalid token").because(fmt.Errorf("parse jwt: %w", err))
 	}
 	if unverified.AC != "" {
 		return g.authenticateRuntime(ctx, raw, unverified.Issuer)
 	}
 	c, err := g.verify(ctx, raw, g.cfg.Issuer, true)
 	if err != nil {
+		var ae *authError
+		if errors.As(err, &ae) && ae.status < 500 {
+			// Unverified, but tells an operator which job sent the bad token.
+			ae.attrs = append(ae.attrs, "unverified_repository", unverified.Repository)
+		}
 		return nil, err
 	}
 	if c.RepositoryID == "" || c.Repository == "" || c.Ref == "" {
@@ -338,8 +349,7 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 		issuers = []string{g.cfg.Issuer}
 	}
 	if !slices.Contains(issuers, issuer) {
-		slog.Debug("untrusted runtime token issuer", "iss", issuer)
-		return nil, unauthorized("invalid token")
+		return nil, unauthorized("invalid token").because(errors.New("untrusted runtime token issuer"), "iss", issuer)
 	}
 	// Runtime tokens are signed with the same keys but carry a different
 	// issuer and an audience we do not control.
@@ -355,8 +365,7 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 	}
 	var scopes []acScope
 	if err := json.Unmarshal([]byte(c.AC), &scopes); err != nil {
-		slog.Debug("invalid ac claim", "err", err)
-		return nil, unauthorized("invalid token")
+		return nil, unauthorized("invalid token").because(fmt.Errorf("ac claim: %w", err))
 	}
 	id := &Identity{Kind: "gha-runtime", Subject: c.Subject, Namespace: "gh:" + c.RepositoryID}
 	// Highest permission first, matching how the actions cache service orders lookups.
@@ -408,8 +417,8 @@ func (g *ghaAuth) checkRepo(c *ghaClaims) error {
 		}
 	}
 	if !ownerOK || !repoOK {
-		slog.Info("repository not allowed", "repository", c.Repository, "repository_id", c.RepositoryID, "owner_id", c.RepositoryOwnerID)
-		return forbidden("repository is not allowed")
+		return forbidden("repository is not allowed").because(nil,
+			"repository", c.Repository, "repository_id", c.RepositoryID, "owner_id", c.RepositoryOwnerID)
 	}
 	return nil
 }
