@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/zeebo/blake3"
@@ -23,25 +24,62 @@ import (
 
 // Server is the HTTP cache server.
 type Server struct {
-	cfg   Config
-	store *Store
-	blobs *BlobStore
-	auth  *Authenticator
-	log   *slog.Logger
-	// uploadSlots bounds concurrent PUTs (spooled bodies and S3 writes).
-	uploadSlots chan struct{}
+	cfg     Config
+	store   *Store
+	blobs   *BlobStore
+	auth    *Authenticator
+	log     *slog.Logger
+	uploads *uploadLimiter
 }
 
 func New(cfg Config, store *Store, blobs *BlobStore, auth *Authenticator, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	n := cfg.Storage.MaxConcurrentUploads
-	if n <= 0 {
-		n = 32
-	}
-	return &Server{cfg: cfg, store: store, blobs: blobs, auth: auth, log: log, uploadSlots: make(chan struct{}, n)}
+	return &Server{cfg: cfg, store: store, blobs: blobs, auth: auth, log: log,
+		uploads: newUploadLimiter(cfg.Storage.MaxConcurrentUploads, cfg.Storage.MaxConcurrentUploadsPerNamespace)}
 }
+
+// uploadLimiter bounds concurrent PUTs (spooled bodies and S3 writes) in
+// total and per namespace, so one tenant cannot hold every slot.
+type uploadLimiter struct {
+	mu           sync.Mutex
+	max, perNS   int
+	total        int
+	perNamespace map[string]int
+}
+
+func newUploadLimiter(max, perNS int) *uploadLimiter {
+	if max <= 0 {
+		max = 32
+	}
+	if perNS <= 0 {
+		perNS = 8
+	}
+	return &uploadLimiter{max: max, perNS: perNS, perNamespace: map[string]int{}}
+}
+
+// acquire reserves a slot without waiting. release must be called once.
+func (l *uploadLimiter) acquire(ns string) (release func(), ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.total >= l.max || l.perNamespace[ns] >= l.perNS {
+		return nil, false
+	}
+	l.total++
+	l.perNamespace[ns]++
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.total--
+		if l.perNamespace[ns]--; l.perNamespace[ns] <= 0 {
+			delete(l.perNamespace, ns)
+		}
+	}, true
+}
+
+// cleanupTimeout bounds bookkeeping that runs after the request context ended.
+const cleanupTimeout = 5 * time.Second
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -56,7 +94,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+api.PathActions+"{id}", s.authed(s.handleGet))
 	mux.HandleFunc("PUT "+api.PathActions+"{id}", s.authed(s.handlePut))
 	mux.HandleFunc("POST "+api.PathActions+"{id}/link", s.authed(s.handleLink))
-	return mux
+	// http.Server timeouts do not cancel the request context, so database,
+	// S3 and JWKS calls get their own deadline.
+	timeout := s.cfg.Storage.RequestTimeout
+	if timeout <= 0 {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, id *Identity)
@@ -73,7 +121,7 @@ func (s *Server) authed(h authedHandler) http.HandlerFunc {
 			var ae *authError
 			if errors.As(err, &ae) {
 				if ae.status >= 500 {
-					s.log.Error("auth backend error", "err", err)
+					s.log.Error("auth backend error", "err", ae.cause)
 				}
 				writeErr(w, ae.status, ae.msg)
 				return
@@ -248,18 +296,23 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity)
 		writeErr(w, http.StatusBadRequest, "Content-Length must equal "+api.HeaderSize)
 		return
 	}
-	select {
-	case s.uploadSlots <- struct{}{}:
-		defer func() { <-s.uploadSlots }()
-	default:
+	release, ok := s.uploads.acquire(id.Namespace)
+	if !ok {
 		w.Header().Set("Retry-After", "5")
 		writeErr(w, http.StatusServiceUnavailable, "too many concurrent uploads")
 		return
 	}
+	defer release()
 	ctx := r.Context()
 	body := http.MaxBytesReader(w, r.Body, m.size)
 
 	sp, err := s.spool(body, m.size)
+	var de *diskError
+	if errors.As(err, &de) {
+		s.log.Error("spool upload", "err", err)
+		writeErr(w, http.StatusInternalServerError, "store failed")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
@@ -303,14 +356,43 @@ func (s *Server) storeBlob(ctx context.Context, id *Identity, m *putMeta, info B
 		return err
 	}
 	if err := s.blobs.Put(ctx, info.Hash, sp.file, info.Size); err != nil {
-		s.store.EndUpload(context.WithoutCancel(ctx), lease) //nolint:errcheck
+		s.endUpload(ctx, lease)
 		return err
 	}
 	if err := s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, nil, lease); err != nil {
-		s.store.EndUpload(context.WithoutCancel(ctx), lease) //nolint:errcheck
+		s.endUpload(ctx, lease)
 		return err
 	}
 	return nil
+}
+
+// endUpload drops a lease after a failed upload. It runs even when ctx is
+// done, but bounded so it cannot hold the upload slot indefinitely. A lease
+// that is not removed expires after gc.upload_lease.
+func (s *Server) endUpload(ctx context.Context, lease int64) {
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	if err := s.store.EndUpload(cctx, lease); err != nil {
+		s.log.Warn("end upload", "err", err)
+	}
+}
+
+// diskError marks a local filesystem failure while spooling, as opposed to a
+// bad request body.
+type diskError struct{ err error }
+
+func (e *diskError) Error() string { return e.err.Error() }
+func (e *diskError) Unwrap() error { return e.err }
+
+// diskWriter tags write errors as diskError.
+type diskWriter struct{ f *os.File }
+
+func (d diskWriter) Write(p []byte) (int, error) {
+	n, err := d.f.Write(p)
+	if err != nil {
+		err = &diskError{err}
+	}
+	return n, err
 }
 
 // spooled is a fully received and hashed request body.
@@ -350,10 +432,10 @@ func (s *Server) spool(r io.Reader, size int64) (*spooled, error) {
 	} else {
 		f, err := os.CreateTemp(s.cfg.Storage.TempDir, "upload-*")
 		if err != nil {
-			return nil, err
+			return nil, &diskError{err}
 		}
 		sp.file = f
-		n, err := io.Copy(io.MultiWriter(f, hashes), r)
+		n, err := io.Copy(io.MultiWriter(diskWriter{f}, hashes), r)
 		if err != nil {
 			sp.cleanup()
 			return nil, err

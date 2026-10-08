@@ -6,11 +6,18 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeebo/blake3"
 
@@ -336,5 +343,167 @@ func TestUploadVerification(t *testing.T) {
 	})
 	if err := put(t, remote(e2, "ro-key"), action("ro"), small); statusCode(err) != 403 {
 		t.Fatalf("read-only key write: expected 403, got %v", err)
+	}
+}
+
+func TestRequestDeadline(t *testing.T) {
+	e := newEnv(t, func(c *server.Config) { c.Storage.RequestTimeout = time.Second })
+	r := remote(e, testKey)
+	b := newBlob(t, 10)
+	if err := put(t, r, action("a"), b); err != nil {
+		t.Fatal(err)
+	}
+	// Hold the blob row lock so the dedup path of the next PUT blocks in postgres.
+	ctx := context.Background()
+	tx, err := e.Store.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM blobs WHERE hash = $1 FOR UPDATE", b.blake3); err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	p := filepath.Join(t.TempDir(), "body")
+	os.WriteFile(p, b.data, 0o644) //nolint:errcheck
+	err = r.Put(cctx, action("b"), b.sha256, b.blake3, int64(len(b.data)), p)
+	if statusCode(err) != 500 {
+		t.Fatalf("PUT blocked on a row lock: expected 500 from the request deadline, got %v", err)
+	}
+	tx.Rollback(ctx) //nolint:errcheck
+	if err := put(t, r, action("b"), b); err != nil {
+		t.Fatalf("PUT after lock release: %v", err)
+	}
+}
+
+func TestAuthBackendErrorHidden(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+	e := newEnv(t, func(c *server.Config) { c.Auth.GHA.Issuer = dead.URL })
+	tok := e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/main", map[string]any{"iss": dead.URL}))
+	_, err := remote(e, tok).Whoami(context.Background())
+	var se *client.StatusError
+	if !errors.As(err, &se) || se.Code != 503 {
+		t.Fatalf("expected 503, got %v", err)
+	}
+	if host := strings.TrimPrefix(dead.URL, "http://"); strings.Contains(se.Msg, host) {
+		t.Fatalf("response leaks issuer address: %q", se.Msg)
+	}
+}
+
+func TestAllowAnyOwnerKeepsRepositoryAllowlist(t *testing.T) {
+	e := newEnv(t, func(c *server.Config) {
+		c.Auth.GHA.AllowedOwners = nil
+		c.Auth.GHA.AllowAnyOwner = true
+		c.Auth.GHA.AllowedRepositories = []string{"gfx-labs/app"}
+	})
+	ok := remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/main", nil)))
+	if _, err := ok.Whoami(context.Background()); err != nil {
+		t.Fatalf("allowed repository: %v", err)
+	}
+	evil := remote(e, e.Issuer.sign(t, ghaClaims("evil/app", "300", "refs/heads/main", nil)))
+	if _, err := evil.Whoami(context.Background()); statusCode(err) != 403 {
+		t.Fatalf("repository outside allowed_repositories: expected 403, got %v", err)
+	}
+}
+
+func TestSpoolDiskErrorHidden(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	e := newEnv(t, func(c *server.Config) { c.Storage.TempDir = missing })
+	err := put(t, remote(e, testKey), action("a"), newBlob(t, 4096))
+	var se *client.StatusError
+	if !errors.As(err, &se) || se.Code != 500 {
+		t.Fatalf("expected 500 for a server disk failure, got %v", err)
+	}
+	if strings.Contains(se.Msg, missing) {
+		t.Fatalf("response leaks temp dir: %q", se.Msg)
+	}
+}
+
+// heldPut starts a PUT and sends one byte of the body, leaving the upload
+// slot held until finish is called.
+type heldPut struct {
+	w    *io.PipeWriter
+	b    blob
+	done chan int
+}
+
+func startPut(t *testing.T, e *env, tok string, act []byte, b blob) *heldPut {
+	t.Helper()
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodPut, e.URL+"/v1/actions/"+hex.EncodeToString(act), pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.ContentLength = int64(len(b.data))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Cache-Output-Id", hex.EncodeToString(b.sha256))
+	req.Header.Set("X-Cache-Blake3", hex.EncodeToString(b.blake3))
+	req.Header.Set("X-Cache-Size", strconv.Itoa(len(b.data)))
+	h := &heldPut{w: pw, b: b, done: make(chan int, 1)}
+	go func() {
+		resp, err := http0().Do(req)
+		if err != nil {
+			h.done <- 0
+			return
+		}
+		resp.Body.Close()
+		h.done <- resp.StatusCode
+	}()
+	if _, err := pw.Write(b.data[:1]); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+func (h *heldPut) finish(t *testing.T) int {
+	t.Helper()
+	if _, err := h.w.Write(h.b.data[1:]); err != nil {
+		t.Fatal(err)
+	}
+	h.w.Close()
+	return <-h.done
+}
+
+func TestUploadSlotsPerNamespace(t *testing.T) {
+	e := newEnv(t, func(c *server.Config) {
+		c.Storage.InlineMaxBytes = 0
+		c.Storage.MaxConcurrentUploads = 4
+		c.Storage.MaxConcurrentUploadsPerNamespace = 2
+	})
+	gh := remote(e, e.Issuer.sign(t, ghaClaims("gfx-labs/app", "100", "refs/heads/main", nil)))
+	var held []*heldPut
+	for i := range 2 {
+		held = append(held, startPut(t, e, testKey, action(fmt.Sprint("held", i)), newBlob(t, 64)))
+	}
+	// Both uploads hold a slot once their spool files exist.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		m, _ := filepath.Glob(filepath.Join(e.Config.Storage.TempDir, "upload-*"))
+		if len(m) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("held uploads did not start, %d spool files", len(m))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	local := remote(e, testKey)
+	if err := put(t, local, action("excess"), newBlob(t, 64)); statusCode(err) != 503 {
+		t.Fatalf("upload over the namespace cap: expected 503, got %v", err)
+	}
+	if err := put(t, gh, action("other"), newBlob(t, 64)); err != nil {
+		t.Fatalf("other namespace blocked by a full namespace: %v", err)
+	}
+	for _, h := range held {
+		if code := h.finish(t); code != 204 {
+			t.Fatalf("held upload: got %d", code)
+		}
+	}
+	for i := range 2 {
+		if err := put(t, local, action(fmt.Sprint("after", i)), newBlob(t, 64)); err != nil {
+			t.Fatalf("slots not released: %v", err)
+		}
 	}
 }

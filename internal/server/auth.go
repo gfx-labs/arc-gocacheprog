@@ -34,6 +34,8 @@ func (i *Identity) CanRead(scope string) bool { return slices.Contains(i.ReadSco
 type authError struct {
 	status int
 	msg    string
+	// cause is logged but not sent to the client.
+	cause error
 }
 
 func (e *authError) Error() string { return e.msg }
@@ -225,7 +227,7 @@ var httpClient = &http.Client{Timeout: discoveryTimeout}
 func (g *ghaAuth) verify(ctx context.Context, raw, issuer string, audience bool) (*ghaClaims, error) {
 	ks, err := g.keySet(ctx, issuer)
 	if err != nil {
-		return nil, &authError{status: http.StatusServiceUnavailable, msg: err.Error()}
+		return nil, &authError{status: http.StatusServiceUnavailable, msg: "token verification unavailable", cause: err}
 	}
 	v := oidc.NewVerifier(issuer, ks, &oidc.Config{
 		ClientID:             g.cfg.Audience,
@@ -361,16 +363,14 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 // checkRepo enforces the allowlists. Numeric IDs are preferred since names
 // can be reused after an account or repository is deleted. Runtime tokens may
 // not carry names, so repository IDs are accepted in allowed_repositories.
+// AllowAnyOwner only lifts the owner check, allowed_repositories still applies.
 func (g *ghaAuth) checkRepo(c *ghaClaims) error {
-	if g.cfg.AllowAnyOwner {
-		return nil
-	}
 	owner := c.RepositoryOwner
 	if owner == "" && c.Repository != "" {
 		owner, _, _ = strings.Cut(c.Repository, "/")
 	}
 	ownerSet := len(g.cfg.AllowedOwners) > 0 || len(g.cfg.AllowedOwnerIDs) > 0
-	ownerOK := !ownerSet
+	ownerOK := !ownerSet || g.cfg.AllowAnyOwner
 	for _, o := range g.cfg.AllowedOwners {
 		if owner != "" && strings.EqualFold(o, owner) {
 			ownerOK = true
