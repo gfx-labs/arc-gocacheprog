@@ -25,7 +25,7 @@ services:
       - seaweed:/data
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
     ports:
-      - "${SEAWEEDFS_S3_PORT:-8333}:8333"
+      - "127.0.0.1:${SEAWEEDFS_S3_PORT:-8333}:8333"
 
   server:
     build:
@@ -35,7 +35,7 @@ services:
     volumes:
       - ./config.compose.yaml:/etc/arc-gocacheprog/config.yaml:ro
     ports:
-      - "${SERVER_PORT:-8080}:8080"
+      - "127.0.0.1:${SERVER_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy

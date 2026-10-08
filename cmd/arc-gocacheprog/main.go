@@ -70,7 +70,12 @@ func run() error {
 
 	var remote *client.Remote
 	if *url != "" {
-		tokens, err := tokenSource(*auth, *key, *audience)
+		tokens, err := func() (client.TokenSource, error) {
+			if _, err := client.CheckCredentialURL(*url, false); err != nil {
+				return nil, fmt.Errorf("ARC_GOCACHE_URL: %w", err)
+			}
+			return tokenSource(*auth, *key, *audience)
+		}()
 		if err != nil {
 			if *whoami {
 				return err
@@ -95,7 +100,9 @@ func run() error {
 		if remote == nil {
 			return fmt.Errorf("ARC_GOCACHE_URL is not set")
 		}
-		id, err := remote.Whoami(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		id, err := remote.Whoami(ctx)
 		if err != nil {
 			return err
 		}

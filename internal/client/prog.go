@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/zeebo/blake3"
+
+	"github.com/gfx-labs/arc-gocacheprog/internal/api"
 )
 
 // Options configures a Prog.
@@ -44,9 +46,9 @@ type Options struct {
 // Stats are reported on close.
 type Stats struct {
 	Gets, LocalHits, RemoteHits, Misses atomic.Int64
-	Puts, Uploads, Linked, UploadErrs  atomic.Int64
-	RemoteGetErrs                      atomic.Int64
-	BytesDown, BytesUp                 atomic.Int64
+	Puts, Uploads, Linked, UploadErrs   atomic.Int64
+	RemoteGetErrs                       atomic.Int64
+	BytesDown, BytesUp                  atomic.Int64
 }
 
 // Prog implements the GOCACHEPROG protocol on top of a local disk cache and
@@ -95,7 +97,7 @@ func New(opts Options) (*Prog, error) {
 		opts.Log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	}
 	for _, d := range []string{"o", "a", "tmp"} {
-		if err := os.MkdirAll(filepath.Join(opts.Dir, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(opts.Dir, d), 0o700); err != nil {
 			return nil, err
 		}
 	}
@@ -236,12 +238,12 @@ func (p *Prog) readLocal(actionID []byte) *localEntry {
 		return nil
 	}
 	out, err := hex.DecodeString(f[1])
-	if err != nil {
+	if err != nil || len(out) != sha256.Size {
 		return nil
 	}
 	size, err1 := strconv.ParseInt(f[2], 10, 64)
 	ns, err2 := strconv.ParseInt(f[3], 10, 64)
-	if err1 != nil || err2 != nil {
+	if err1 != nil || err2 != nil || size < 0 {
 		return nil
 	}
 	fi, err := os.Stat(p.outputPath(out))
@@ -253,7 +255,7 @@ func (p *Prog) readLocal(actionID []byte) *localEntry {
 
 func (p *Prog) writeLocal(actionID, outputID []byte, size int64, t time.Time) error {
 	path := p.actionPath(actionID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	data := fmt.Sprintf("v1 %x %d %d\n", outputID, size, t.UnixNano())
@@ -280,7 +282,7 @@ func writeAtomic(dir, path string, data []byte) error {
 // installOutput moves a verified temp file to its content-addressed path.
 func (p *Prog) installOutput(tmp string, outputID []byte) (string, error) {
 	dst := p.outputPath(outputID)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
@@ -291,8 +293,8 @@ func (p *Prog) installOutput(tmp string, outputID []byte) (string, error) {
 
 func (p *Prog) handleGet(ctx context.Context, req *Request) *Response {
 	p.Stats.Gets.Add(1)
-	if len(req.ActionID) == 0 {
-		return &Response{ID: req.ID, Err: "missing action id"}
+	if len(req.ActionID) == 0 || len(req.ActionID) > api.MaxIDLen {
+		return &Response{ID: req.ID, Err: "invalid action id"}
 	}
 	if e := p.readLocal(req.ActionID); e != nil {
 		p.Stats.LocalHits.Add(1)
@@ -396,6 +398,10 @@ func (p *Prog) handlePut(req *Request, r *reader) *Response {
 		return &Response{ID: req.ID, Err: fmt.Sprintf("body size %d does not match BodySize %d", n, req.BodySize)}
 	}
 	sum := sh.Sum(nil)
+	if len(req.ActionID) == 0 || len(req.ActionID) > api.MaxIDLen {
+		os.Remove(tmp)
+		return &Response{ID: req.ID, Err: "invalid action id"}
+	}
 	if !bytes.Equal(sum, req.OutputID) {
 		os.Remove(tmp)
 		return &Response{ID: req.ID, Err: "body sha256 does not match OutputID"}

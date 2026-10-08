@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -21,7 +22,14 @@ type Remote struct {
 	BaseURL string
 	HTTP    *http.Client
 	Tokens  TokenSource
+	// MaxBodyBytes bounds the size of a downloaded entry. 0 means DefaultMaxBodyBytes.
+	MaxBodyBytes int64
 }
+
+// DefaultMaxBodyBytes matches the server's default max_blob_bytes.
+const DefaultMaxBodyBytes int64 = 1 << 30
+
+const maxMetadataBytes = 1 << 20
 
 // RemoteEntry is the metadata of a remote hit.
 type RemoteEntry struct {
@@ -40,11 +48,15 @@ type StatusError struct {
 func (e *StatusError) Error() string { return fmt.Sprintf("server returned %d: %s", e.Code, e.Msg) }
 
 func (r *Remote) do(ctx context.Context, method, path string, body io.Reader, hdr http.Header, size int64) (*http.Response, error) {
+	base, err := CheckCredentialURL(r.BaseURL, false)
+	if err != nil {
+		return nil, err
+	}
 	tok, err := r.Tokens.Token(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get token: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(r.BaseURL, "/")+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(base.String(), "/")+path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +68,7 @@ func (r *Remote) do(ctx context.Context, method, path string, body io.Reader, hd
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("User-Agent", "arc-gocacheprog")
-	return r.HTTP.Do(req)
+	return credentialClient(r.HTTP).Do(req)
 }
 
 func readErr(resp *http.Response) error {
@@ -91,16 +103,27 @@ func (r *Remote) Get(ctx context.Context, actionID []byte, w io.Writer) (*Remote
 	if e.Size, err = strconv.ParseInt(resp.Header.Get(api.HeaderSize), 10, 64); err != nil {
 		return nil, fmt.Errorf("bad size header: %w", err)
 	}
+	limit := r.MaxBodyBytes
+	if limit <= 0 {
+		limit = DefaultMaxBodyBytes
+	}
+	limit = min(limit, math.MaxInt64-1)
+	if e.Size < 0 || e.Size > limit {
+		return nil, fmt.Errorf("size header %d outside [0, %d]", e.Size, limit)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != e.Size {
+		return nil, fmt.Errorf("content length %d does not match size header %d", resp.ContentLength, e.Size)
+	}
 	if t, err := time.Parse(time.RFC3339Nano, resp.Header.Get(api.HeaderTime)); err == nil {
 		e.Time = t
 	}
 	e.Scope = resp.Header.Get(api.HeaderScope)
-	n, err := io.Copy(w, resp.Body)
+	n, err := io.Copy(w, io.LimitReader(resp.Body, e.Size+1))
 	if err != nil {
 		return nil, err
 	}
 	if n != e.Size {
-		return nil, fmt.Errorf("short body: %d of %d bytes", n, e.Size)
+		return nil, fmt.Errorf("body length does not match size header %d", e.Size)
 	}
 	return &e, nil
 }
@@ -167,7 +190,7 @@ func (r *Remote) Whoami(ctx context.Context) (*api.Identity, error) {
 		return nil, readErr(resp)
 	}
 	var id api.Identity
-	if err := json.NewDecoder(resp.Body).Decode(&id); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxMetadataBytes)).Decode(&id); err != nil {
 		return nil, err
 	}
 	return &id, nil

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -54,9 +53,9 @@ func (g *GHAToken) Token(ctx context.Context) (string, error) {
 	if g.tok != "" && time.Until(g.exp) > time.Minute {
 		return g.tok, nil
 	}
-	u, err := url.Parse(g.RequestURL)
+	u, err := CheckCredentialURL(g.RequestURL, true)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("ACTIONS_ID_TOKEN_REQUEST_URL: %w", err)
 	}
 	if g.Audience != "" {
 		q := u.Query()
@@ -69,14 +68,14 @@ func (g *GHAToken) Token(ctx context.Context) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+g.RequestToken)
 	req.Header.Set("Accept", "application/json")
-	resp, err := g.HTTP.Do(req)
+	resp, err := credentialClient(g.HTTP).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("request oidc token: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("request oidc token: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("request oidc token: status %d", resp.StatusCode)
 	}
 	var out struct {
 		Value string `json:"value"`
