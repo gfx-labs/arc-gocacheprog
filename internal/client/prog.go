@@ -610,12 +610,15 @@ const (
 	// throttleMaxRetryAfter bounds a server-sent Retry-After. The close
 	// wait still ends retries at shutdown.
 	throttleMaxRetryAfter = 10 * time.Minute
+	// maxUnavailableRetries bounds retries of a 503 without Retry-After.
+	maxUnavailableRetries = 3
 )
 
 // retryThrottled runs fn until it returns something other than a throttle
 // response. It honors Retry-After and the shared pause, and gives up only
 // when the close wait for uploads runs out.
 func (p *Prog) retryThrottled(fn func(context.Context) error) error {
+	unavailable := 0
 	for attempt := 0; ; attempt++ {
 		if err := p.waitPause(); err != nil {
 			return err
@@ -623,11 +626,32 @@ func (p *Prog) retryThrottled(fn func(context.Context) error) error {
 		ctx, cancel := context.WithTimeout(p.stopCtx, uploadAttemptTimeout)
 		err := fn(ctx)
 		cancel()
+		if statusOf(err) == http.StatusServiceUnavailable && !isThrottle(err) && unavailable < maxUnavailableRetries {
+			// A 503 without Retry-After, often from a proxy during a
+			// restart. Retry briefly without pausing other workers.
+			unavailable++
+			if serr := p.sleep(throttleDelay(0, unavailable-1)); serr != nil {
+				return err
+			}
+			continue
+		}
 		if !isThrottle(err) {
 			return err
 		}
 		d := p.notePause(err, attempt)
 		p.log.Debug("server throttled upload, retrying", "attempt", attempt+1, "delay", d, "err", err)
+	}
+}
+
+// sleep waits for d or until the close wait runs out.
+func (p *Prog) sleep(d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-p.stopCtx.Done():
+		return p.stopCtx.Err()
 	}
 }
 

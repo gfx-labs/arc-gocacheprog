@@ -87,6 +87,8 @@ Client environment variables:
 
 Use ephemeral runners for untrusted CI jobs. Local identity partitioning prevents accidental cross-repository or cross-scope reuse, but it cannot protect files from malicious jobs running as the same OS user. `ARC_GOCACHE_READONLY` only disables remote uploads. The initial identity request has a 30-second timeout. A failed identity request uses a fresh session cache that is removed on orderly exit.
 
+Uploads run in the background, and on exit the client waits up to 5 minutes for them. When the server throttles with 429, or 503 with `Retry-After`, the client waits at least the `Retry-After` delay, with exponential backoff and jitter, and pauses all upload workers together. It keeps retrying until the exit wait runs out. A 503 without `Retry-After` is retried 3 times. Remote gets are not retried, since they block the build, but a throttled get also pauses uploads.
+
 ## Local usage with a static key
 
 Start the local stack (Postgres, SeaweedFS and the server, using `deploy/config.compose.yaml`):
