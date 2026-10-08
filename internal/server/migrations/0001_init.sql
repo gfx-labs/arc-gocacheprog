@@ -1,3 +1,4 @@
+-- +goose Up
 -- Content-addressed blobs keyed by BLAKE3-256. Small blobs are stored inline,
 -- larger ones in S3 under a sharded key derived from the hash.
 CREATE TABLE blobs (
@@ -30,3 +31,7 @@ CREATE TABLE entries (
 CREATE INDEX entries_blob_hash_idx ON entries (blob_hash);
 CREATE INDEX entries_accessed_at_idx ON entries (accessed_at);
 CREATE INDEX entries_ns_blob_idx ON entries (namespace, blob_hash);
+
+-- +goose Down
+DROP TABLE entries;
+DROP TABLE blobs;

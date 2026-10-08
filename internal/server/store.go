@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 )
 
 //go:embed migrations/*.sql
@@ -38,57 +39,28 @@ func (s *Store) Close() { s.pool.Close() }
 
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
-// Migrate applies embedded migrations in order. A session advisory lock keeps
-// concurrently starting servers from racing.
+// Migrate applies the embedded goose migrations. goose's Postgres session
+// lock keeps concurrently starting servers from racing.
 func (s *Store) Migrate(ctx context.Context) error {
-	conn, err := s.pool.Acquire(ctx)
+	migrations, err := fs.Sub(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
-	const lockID = 0x6763_7072_6f67 // "gcprog"
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockID); err != nil {
-		return err
-	}
-	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", lockID) //nolint:errcheck
-
-	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
-		return err
-	}
-	names, err := fs.Glob(migrationsFS, "migrations/*.sql")
+	locker, err := lock.NewPostgresSessionLocker()
 	if err != nil {
 		return err
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		version := strings.TrimSuffix(strings.TrimPrefix(name, "migrations/"), ".sql")
-		var exists bool
-		if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)", version).Scan(&exists); err != nil {
-			return err
-		}
-		if exists {
-			continue
-		}
-		sql, err := migrationsFS.ReadFile(name)
-		if err != nil {
-			return err
-		}
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, string(sql)); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck
-			return fmt.Errorf("migration %s: %w", version, err)
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version) VALUES ($1)", version); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck
-			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
+	db := stdlib.OpenDBFromPool(s.pool)
+	defer db.Close()
+	p, err := goose.NewProvider(goose.DialectPostgres, db, migrations,
+		goose.WithSessionLocker(locker),
+		goose.WithDisableGlobalRegistry(true),
+	)
+	if err != nil {
+		return err
+	}
+	if _, err := p.Up(ctx); err != nil {
+		return fmt.Errorf("goose up: %w", err)
 	}
 	return nil
 }
