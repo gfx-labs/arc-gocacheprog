@@ -144,9 +144,9 @@ func (l *Limiter) AdmitWrite(namespace string, size int64) (time.Duration, bool)
 	if cost > l.cfg.WriteBytesBurst {
 		return rate.InfDuration, false
 	}
-	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	t := l.tenants[namespace]
 	if t == nil {
 		if len(l.tenants) >= l.cfg.MaxTenants {
