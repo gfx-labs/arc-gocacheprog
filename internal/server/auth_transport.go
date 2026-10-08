@@ -1,7 +1,9 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -57,3 +59,41 @@ func authRedirect(req *http.Request, via []*http.Request) error {
 	}
 	return validateAuthURL(req.URL.String())
 }
+
+// maxDiscoveryBytes bounds OIDC discovery responses, which go-oidc reads whole.
+const maxDiscoveryBytes = 1 << 20
+
+var errResponseTooLarge = errors.New("authentication endpoint response exceeds size limit")
+
+// limitBodyTransport fails reads once a response body passes max bytes.
+type limitBodyTransport struct {
+	base http.RoundTripper
+	max  int64
+}
+
+func (t limitBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &cappedBody{rc: resp.Body, left: t.max}
+	return resp, nil
+}
+
+type cappedBody struct {
+	rc   io.ReadCloser
+	left int64
+}
+
+func (c *cappedBody) Read(p []byte) (int, error) {
+	if int64(len(p)) > c.left+1 {
+		p = p[:c.left+1]
+	}
+	n, err := c.rc.Read(p)
+	if c.left -= int64(n); c.left < 0 {
+		return 0, errResponseTooLarge
+	}
+	return n, err
+}
+
+func (c *cappedBody) Close() error { return c.rc.Close() }

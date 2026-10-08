@@ -236,7 +236,11 @@ func (g *ghaAuth) keySet(ctx context.Context, issuer string) (oidc.KeySet, error
 }
 
 // httpClient bounds JWKS and discovery requests.
-var httpClient = &http.Client{Timeout: discoveryTimeout, CheckRedirect: authRedirect}
+var httpClient = &http.Client{
+	Timeout:       discoveryTimeout,
+	CheckRedirect: authRedirect,
+	Transport:     limitBodyTransport{base: http.DefaultTransport, max: maxDiscoveryBytes},
+}
 
 func (g *ghaAuth) verify(ctx context.Context, raw, issuer string, audience bool) (*ghaClaims, error) {
 	ks, err := g.keySet(ctx, issuer)
