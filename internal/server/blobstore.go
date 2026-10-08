@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
 // BlobStore stores large content-addressed blobs in S3. Object keys are
@@ -36,6 +37,7 @@ func NewS3Client(ctx context.Context, c S3Config) (*s3.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
+	otelaws.AppendMiddlewares(&awsCfg.APIOptions)
 	pathStyle := c.Endpoint != ""
 	if c.UsePathStyle != nil {
 		pathStyle = *c.UsePathStyle

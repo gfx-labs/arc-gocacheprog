@@ -178,14 +178,12 @@ func (l *Limiter) sweepLocked(now time.Time) {
 	}
 }
 
-// Middleware rejects requests over the global request rate with 429.
-func (l *Limiter) Middleware(next http.Handler) http.Handler {
+// limitRequests rejects requests over the global request rate with 429.
+func (s *Server) limitRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if wait, ok := l.AdmitRequest(); !ok {
-			if ri := infoFrom(r.Context()); ri != nil {
-				ri.errMsg = "request rate limit"
-			}
-			writeLimited(w, wait, "request rate limit")
+		if wait, ok := s.limits.AdmitRequest(); !ok {
+			s.metrics.reject(r.Context(), rejectRateLimit)
+			s.limited(w, r, wait, "request rate limit")
 			return
 		}
 		next.ServeHTTP(w, r)

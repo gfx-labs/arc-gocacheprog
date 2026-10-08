@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/gfx-labs/arc-gocacheprog/internal/api"
 )
 
@@ -33,6 +35,9 @@ func infoFrom(ctx context.Context) *reqInfo {
 
 func (ri *reqInfo) logAttrs(r *http.Request) []any {
 	a := []any{"request_id", ri.id, "method", r.Method, "route", ri.route}
+	if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
+		a = append(a, "trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
+	}
 	if id := ri.identity; id != nil {
 		a = append(a, "auth_kind", id.Kind, "namespace", id.Namespace, "write_scope", id.WriteScope)
 	}

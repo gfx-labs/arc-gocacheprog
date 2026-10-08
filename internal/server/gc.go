@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const gcBatch = 500
@@ -28,18 +31,19 @@ type GCStats struct {
 
 // GC removes expired entries and unreferenced blobs.
 type GC struct {
-	cfg   GCConfig
-	store *Store
-	blobs *BlobStore
-	log   *slog.Logger
-	now   func() time.Time
+	cfg     GCConfig
+	store   *Store
+	blobs   *BlobStore
+	log     *slog.Logger
+	now     func() time.Time
+	metrics *metrics
 }
 
 func NewGC(cfg GCConfig, store *Store, blobs *BlobStore, log *slog.Logger) *GC {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &GC{cfg: cfg, store: store, blobs: blobs, log: log, now: time.Now}
+	return &GC{cfg: cfg, store: store, blobs: blobs, log: log, now: time.Now, metrics: newMetrics()}
 }
 
 // Loop runs GC every interval until ctx is done. Only one server holding the
@@ -48,12 +52,12 @@ func (g *GC) Loop(ctx context.Context) {
 	t := time.NewTicker(g.cfg.Interval)
 	defer t.Stop()
 	for {
-		st, ran, err := g.RunLocked(ctx)
+		st, ran, err := g.runTraced(ctx)
 		switch {
 		case err != nil:
-			g.log.Error("gc failed", "err", err)
+			g.log.ErrorContext(ctx, "gc failed", "err", err)
 		case ran:
-			g.log.Info("gc done", "expired", st.ExpiredEntries, "evicted", st.EvictedEntries,
+			g.log.InfoContext(ctx, "gc done", "expired", st.ExpiredEntries, "evicted", st.EvictedEntries,
 				"blobs", st.DeletedBlobs, "bytes", st.DeletedBytes, "orphans", st.OrphanObjects)
 		}
 		select {
@@ -62,6 +66,37 @@ func (g *GC) Loop(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// runTraced runs RunLocked in its own trace and records GC metrics.
+func (g *GC) runTraced(ctx context.Context) (GCStats, bool, error) {
+	ctx, span := tracer.Start(ctx, "gc", trace.WithNewRoot())
+	start := time.Now()
+	st, ran, err := g.RunLocked(ctx)
+	span.SetAttributes(attribute.Bool("gocache.gc.ran", ran))
+	endSpan(span, err)
+	ctx = context.WithoutCancel(ctx)
+	switch {
+	case err != nil:
+		g.metrics.gcRuns.Add(ctx, 1, resultAttr("error"))
+	case !ran:
+		g.metrics.gcRuns.Add(ctx, 1, resultAttr("skipped"))
+	default:
+		g.metrics.gcRuns.Add(ctx, 1, resultAttr("done"))
+		g.metrics.gcDuration.Record(ctx, time.Since(start).Seconds())
+	}
+	for kind, n := range map[string]int64{
+		"expired": st.ExpiredEntries, "evicted": st.EvictedEntries,
+		"blob": st.DeletedBlobs, "orphan": st.OrphanObjects,
+	} {
+		if n > 0 {
+			g.metrics.gcRemoved.Add(ctx, n, metric.WithAttributeSet(attribute.NewSet(attribute.String("kind", kind))))
+		}
+	}
+	if st.DeletedBytes > 0 {
+		g.metrics.gcRemovedBytes.Add(ctx, st.DeletedBytes)
+	}
+	return st, ran, err
 }
 
 // RunLocked runs a pass if no other server is running one.

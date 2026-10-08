@@ -122,6 +122,38 @@ Read `deploy/SECURITY.md` before production deployment. The server needs a trust
 
 Container image: `ghcr.io/gfx-labs/arc-gocacheprog`. The default command reads `/etc/arc-gocacheprog/config.yaml`. The image runs as a non-root user on distroless.
 
+## Observability
+
+**Logs.** JSON on stderr. Every request gets a `request_id`, also returned in the `X-Request-Id` header. Rejected (4xx) and failed (5xx) requests are logged at warn and error with the route, auth kind, namespace, write scope, status, duration and internal cause. Successful requests and cache misses log at info with `access_log: true`, otherwise at debug. When tracing is on, lines carry `trace_id` and `span_id`.
+
+**Traces and metrics.** OpenTelemetry, configured with the standard `OTEL_*` environment variables. Nothing is exported unless one is set:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318   # traces and metrics over OTLP/HTTP
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc                          # optional, with port 4317
+OTEL_METRICS_EXPORTER=prometheus                          # optional, serves /metrics on port 9464
+OTEL_EXPORTER_PROMETHEUS_HOST=0.0.0.0                     # the default is localhost, unreachable by a scraper
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod
+```
+
+Each request has a server span named by route, with child spans for Postgres queries (otelpgx), S3 calls (otelaws) and upload spooling. Incoming trace context from clients is linked, not used as the parent. GC passes are their own traces.
+
+Metrics, besides the standard `http.server.*`, `db.client.*`, `pgxpool.*` and Go runtime metrics:
+
+| Metric | Attributes | Meaning |
+| --- | --- | --- |
+| `gocache.lookups` | `result`: hit, miss, error | Entry lookups. Hit rate is hit / (hit + miss). |
+| `gocache.uploads` | `result`: stored, deduplicated, error | Uploads that reached storage. |
+| `gocache.links` | `result`: linked, missing, error | Link requests that reached storage. |
+| `gocache.rejections` | `reason`: auth, bad_request, no_scope, request_rate, write_rate, upload_slots, hash_mismatch | Requests rejected before storage. |
+| `gocache.upload.size`, `gocache.download.size` | | Bytes received and served. |
+| `gocache.uploads.active` | | Uploads holding a concurrency slot. |
+| `gocache.gc.runs` | `result`: done, skipped, error | GC passes. |
+| `gocache.gc.removed` | `kind`: expired, evicted, blob, orphan | Items removed by GC. |
+| `gocache.gc.removed.size`, `gocache.gc.duration` | | Bytes removed and pass duration. |
+
+Metrics carry no namespace or repository labels, to keep cardinality bounded. Use logs or traces for per-repository detail.
+
 ## Garbage collection
 
 The server runs GC every `gc.interval` while `gc.enabled` is set. A Postgres lock keeps multiple replicas from running it at once. Each pass does the following:

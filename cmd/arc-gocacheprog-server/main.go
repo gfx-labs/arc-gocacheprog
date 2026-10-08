@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"github.com/gfx-labs/arc-gocacheprog/internal/server"
+	"github.com/gfx-labs/arc-gocacheprog/internal/telemetry"
 )
 
 func main() {
@@ -43,6 +45,19 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Before the store and S3 client, which capture the global providers.
+	shutdownTelemetry, err := telemetry.Setup(ctx, "arc-gocacheprog-server", version())
+	if err != nil {
+		return fmt.Errorf("telemetry: %w", err)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdownTelemetry(sctx); err != nil {
+			log.Warn("telemetry shutdown", "err", err)
+		}
+	}()
 
 	store, err := server.OpenStore(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -116,4 +131,20 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func version() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	if v := bi.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "vcs.revision" {
+			return s.Value
+		}
+	}
+	return "(devel)"
 }

@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/zeebo/blake3"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gfx-labs/arc-gocacheprog/internal/api"
 )
@@ -31,6 +33,7 @@ type Server struct {
 	log     *slog.Logger
 	uploads *uploadLimiter
 	limits  *Limiter
+	metrics *metrics
 }
 
 func New(cfg Config, store *Store, blobs *BlobStore, auth *Authenticator, log *slog.Logger) *Server {
@@ -39,7 +42,8 @@ func New(cfg Config, store *Store, blobs *BlobStore, auth *Authenticator, log *s
 	}
 	return &Server{cfg: cfg, store: store, blobs: blobs, auth: auth, log: log,
 		uploads: newUploadLimiter(cfg.Storage.MaxConcurrentUploads, cfg.Storage.MaxConcurrentUploadsPerNamespace),
-		limits:  NewLimiter(cfg.Limits)}
+		limits:  NewLimiter(cfg.Limits),
+		metrics: newMetrics()}
 }
 
 // uploadLimiter bounds concurrent PUTs (spooled bodies and S3 writes) in
@@ -97,18 +101,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT "+api.PathActions+"{id}", s.authed(s.handlePut))
 	mux.HandleFunc("POST "+api.PathActions+"{id}/link", s.authed(s.handleLink))
 	routed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, route := mux.Handler(r)
 		if ri := infoFrom(r.Context()); ri != nil {
-			_, ri.route = mux.Handler(r)
+			ri.route = route
 		}
+		setRoute(r.Context(), route)
 		mux.ServeHTTP(w, r)
 	})
 	// Bound backend work explicitly rather than relying on socket deadlines,
 	// and set those too in case the embedding server has none.
 	timeout := s.cfg.Storage.RequestTimeout
 	if timeout <= 0 {
-		return s.logRequests(s.limits.Middleware(routed))
+		return instrument(s.logRequests(s.limitRequests(routed)))
 	}
-	return s.logRequests(s.limits.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return instrument(s.logRequests(s.limitRequests(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
 		rc.SetReadDeadline(time.Now().Add(timeout)) //nolint:errcheck
 		// Leave time to write the error response after the context expires.
@@ -116,7 +122,7 @@ func (s *Server) Handler() http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		routed.ServeHTTP(w, r.WithContext(ctx))
-	})))
+	}))))
 }
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, id *Identity)
@@ -125,6 +131,7 @@ func (s *Server) authed(h authedHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tok, ok := bearer(r)
 		if !ok {
+			s.metrics.reject(r.Context(), rejectAuth)
 			s.fail(w, r, http.StatusUnauthorized, "missing bearer token", nil)
 			return
 		}
@@ -132,6 +139,9 @@ func (s *Server) authed(h authedHandler) http.HandlerFunc {
 		if err != nil {
 			var ae *authError
 			if errors.As(err, &ae) {
+				if ae.status < 500 {
+					s.metrics.reject(r.Context(), rejectAuth)
+				}
 				addLogAttrs(r, ae.attrs...)
 				s.fail(w, r, ae.status, ae.msg, ae.cause)
 				return
@@ -142,6 +152,10 @@ func (s *Server) authed(h authedHandler) http.HandlerFunc {
 		if ri := infoFrom(r.Context()); ri != nil {
 			ri.identity = id
 		}
+		trace.SpanFromContext(r.Context()).SetAttributes(
+			attribute.String("gocache.auth_kind", id.Kind),
+			attribute.String("gocache.namespace", id.Namespace),
+			attribute.String("gocache.write_scope", id.WriteScope))
 		h(w, r, id)
 	}
 }
@@ -175,10 +189,12 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request, id *Identi
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity) {
 	actionID, err := api.DecodeID(r.PathValue("id"))
 	if err != nil {
+		s.metrics.reject(r.Context(), rejectBadRequest)
 		s.fail(w, r, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 	if len(id.ReadScopes) == 0 {
+		s.metrics.reject(r.Context(), rejectNoScope)
 		s.fail(w, r, http.StatusForbidden, "token has no read scopes", nil)
 		return
 	}
@@ -186,10 +202,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 	ctx := r.Context()
 	e, err := s.store.Lookup(ctx, id.Namespace, id.ReadScopes, actionID)
 	if err != nil {
+		s.metrics.lookups.Add(ctx, 1, resultAttr("error"))
 		s.fail(w, r, http.StatusInternalServerError, "lookup failed", err)
 		return
 	}
 	if e == nil {
+		s.metrics.lookups.Add(ctx, 1, resultAttr("miss"))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -208,15 +226,18 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 			} else if dropped {
 				log.Warn("dropped blob and its entries")
 			}
+			s.metrics.lookups.Add(ctx, 1, resultAttr("miss"))
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		if err != nil {
+			s.metrics.lookups.Add(ctx, 1, resultAttr("error"))
 			s.fail(w, r, http.StatusBadGateway, "object store error", err)
 			return
 		}
 	}
 	defer body.Close()
+	s.metrics.lookups.Add(ctx, 1, resultAttr("hit"))
 
 	if err := s.store.Touch(ctx, id.Namespace, e.Scope, actionID, e.BlobHash, s.cfg.Storage.TouchInterval); err != nil {
 		s.reqLog(r).Warn("touch entry", "err", err)
@@ -232,6 +253,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 	h.Set(api.HeaderScope, e.Scope)
 	w.WriteHeader(http.StatusOK)
 	n, err := io.Copy(w, io.LimitReader(body, e.Size+1))
+	s.metrics.downloadBytes.Add(ctx, n)
 	if err != nil || n != e.Size {
 		// Headers are sent. Abort the connection so the client sees a broken
 		// response instead of a short body.
@@ -278,77 +300,96 @@ func (s *Server) parsePutMeta(r *http.Request, needHash bool) (*putMeta, error) 
 // clients can skip uploading bodies the server has.
 func (s *Server) handleLink(w http.ResponseWriter, r *http.Request, id *Identity) {
 	if id.WriteScope == "" {
+		s.metrics.reject(r.Context(), rejectNoScope)
 		s.fail(w, r, http.StatusForbidden, "token has no write scope", nil)
 		return
 	}
 	m, err := s.parsePutMeta(r, true)
 	if err != nil {
+		s.metrics.reject(r.Context(), rejectBadRequest)
 		s.fail(w, r, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 	addLogAttrs(r, "action_id", hex.EncodeToString(m.actionID), "size", m.size)
 	if wait, ok := s.limits.AdmitWrite(id.Namespace, 0); !ok {
+		s.metrics.reject(r.Context(), rejectWriteLimit)
 		s.limited(w, r, wait, "write rate limit")
 		return
 	}
 	ctx := r.Context()
 	b, err := s.store.LinkableBlob(ctx, id.Namespace, id.ReadScopes, m.blake3)
 	if err != nil {
+		s.metrics.links.Add(ctx, 1, resultAttr("error"))
 		s.fail(w, r, http.StatusInternalServerError, "lookup failed", err)
 		return
 	}
 	if b == nil || b.Size != m.size || !bytes.Equal(b.SHA256, m.outputID) {
+		s.metrics.links.Add(ctx, 1, resultAttr("missing"))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	err = s.store.LinkExisting(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, *b)
 	if errors.Is(err, errBlobGone) {
+		s.metrics.links.Add(ctx, 1, resultAttr("missing"))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	if err != nil {
+		s.metrics.links.Add(ctx, 1, resultAttr("error"))
 		s.fail(w, r, http.StatusInternalServerError, "link failed", err)
 		return
 	}
+	s.metrics.links.Add(ctx, 1, resultAttr("linked"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity) {
 	if id.WriteScope == "" {
+		s.metrics.reject(r.Context(), rejectNoScope)
 		s.fail(w, r, http.StatusForbidden, "token has no write scope", nil)
 		return
 	}
 	m, err := s.parsePutMeta(r, false)
 	if err != nil {
+		s.metrics.reject(r.Context(), rejectBadRequest)
 		s.fail(w, r, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 	addLogAttrs(r, "action_id", hex.EncodeToString(m.actionID), "size", m.size)
 	if r.ContentLength != m.size {
+		s.metrics.reject(r.Context(), rejectBadRequest)
 		s.fail(w, r, http.StatusBadRequest, "Content-Length must equal "+api.HeaderSize, nil)
 		return
 	}
 	if wait, ok := s.limits.AdmitWrite(id.Namespace, m.size); !ok {
+		s.metrics.reject(r.Context(), rejectWriteLimit)
 		s.limited(w, r, wait, "write rate limit")
 		return
 	}
 	release, ok := s.uploads.acquire(id.Namespace)
 	if !ok {
+		s.metrics.reject(r.Context(), rejectUploadSlots)
 		w.Header().Set("Retry-After", "5")
 		s.fail(w, r, http.StatusServiceUnavailable, "too many concurrent uploads", nil)
 		return
 	}
 	defer release()
 	ctx := r.Context()
+	s.metrics.uploadsActive.Add(ctx, 1)
+	defer s.metrics.uploadsActive.Add(context.WithoutCancel(ctx), -1)
 	body := http.MaxBytesReader(w, r.Body, m.size)
 
+	_, span := tracer.Start(ctx, "spool upload", trace.WithAttributes(attribute.Int64("gocache.size", m.size)))
 	sp, err := s.spool(body, m.size)
+	endSpan(span, err)
 	var de *diskError
 	if errors.As(err, &de) {
+		s.metrics.uploads.Add(ctx, 1, resultAttr("error"))
 		s.fail(w, r, http.StatusInternalServerError, "store failed", fmt.Errorf("spool upload: %w", err))
 		return
 	}
 	if err != nil {
+		s.metrics.reject(ctx, rejectBadRequest)
 		s.fail(w, r, http.StatusBadRequest, "read body: "+err.Error(), nil)
 		return
 	}
@@ -357,47 +398,59 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity)
 	// cmd/go defines OutputID as the sha256 of the body. Enforcing it means a
 	// token can only map actions to content it actually sent.
 	if !bytes.Equal(sp.sha256, m.outputID) {
+		s.metrics.reject(ctx, rejectHashCheck)
 		s.fail(w, r, http.StatusBadRequest, "body sha256 does not match output id", nil)
 		return
 	}
 	if m.blake3 != nil && !bytes.Equal(sp.blake3, m.blake3) {
+		s.metrics.reject(ctx, rejectHashCheck)
 		s.fail(w, r, http.StatusBadRequest, "body blake3 does not match header", nil)
 		return
 	}
 	info := BlobInfo{Hash: sp.blake3, SHA256: sp.sha256, Size: sp.size}
 
-	if err := s.storeBlob(ctx, id, m, info, sp); err != nil {
+	dedup, err := s.storeBlob(ctx, id, m, info, sp)
+	if err != nil {
+		s.metrics.uploads.Add(ctx, 1, resultAttr("error"))
 		s.fail(w, r, http.StatusInternalServerError, "store failed", err)
 		return
 	}
+	result := "stored"
+	if dedup {
+		result = "deduplicated"
+	}
+	s.metrics.uploads.Add(ctx, 1, resultAttr(result))
+	s.metrics.uploadBytes.Add(ctx, m.size)
+	addLogAttrs(r, "result", result)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) storeBlob(ctx context.Context, id *Identity, m *putMeta, info BlobInfo, sp *spooled) error {
+// storeBlob reports whether the blob was already stored.
+func (s *Server) storeBlob(ctx context.Context, id *Identity, m *putMeta, info BlobInfo, sp *spooled) (bool, error) {
 	// Dedup: if the blob row exists, LinkExisting locks it while linking, which
 	// keeps GC from deleting the object underneath us.
 	err := s.store.LinkExisting(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info)
 	if !errors.Is(err, errBlobGone) {
-		return err
+		return err == nil, err
 	}
 	if sp.mem != nil {
-		return s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, sp.mem, 0)
+		return false, s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, sp.mem, 0)
 	}
 	// The lease keeps GC from deleting the object between the S3 write and
 	// the row insert, without holding a transaction open during the upload.
 	lease, err := s.store.StartUpload(ctx, info.Hash)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := s.blobs.Put(ctx, info.Hash, sp.file, info.Size); err != nil {
 		s.endUpload(ctx, lease)
-		return err
+		return false, err
 	}
 	if err := s.store.InsertBlob(ctx, id.Namespace, id.WriteScope, m.actionID, m.outputID, info, nil, lease); err != nil {
 		s.endUpload(ctx, lease)
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
 }
 
 // endUpload drops a lease after a failed upload. It runs even when ctx is
@@ -407,7 +460,7 @@ func (s *Server) endUpload(ctx context.Context, lease int64) {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
 	if err := s.store.EndUpload(cctx, lease); err != nil {
-		s.log.Warn("end upload", "err", err)
+		s.log.WarnContext(ctx, "end upload", "err", err)
 	}
 }
 

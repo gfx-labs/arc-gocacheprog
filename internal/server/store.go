@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -24,13 +25,23 @@ type Store struct {
 }
 
 func OpenStore(ctx context.Context, url string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	// SQL text is kept in spans, parameters are not.
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName())
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	if err := otelpgx.RecordStats(pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pool metrics: %w", err)
 	}
 	return &Store{pool: pool}, nil
 }
