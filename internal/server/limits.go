@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // LimitsConfig configures in-memory admission control. State is per replica:
@@ -46,21 +48,30 @@ func DefaultLimits() LimitsConfig {
 	}
 }
 
-func positiveFinite(f float64) bool { return f > 0 && !math.IsInf(f, 0) && !math.IsNaN(f) }
+// maxByteTokens keeps byte counts exact in rate's float64 token math and
+// within int on every platform.
+const maxByteTokens = min(1<<53, math.MaxInt)
+
+// validRate reports whether f is a usable finite rate. rate.Inf is
+// math.MaxFloat64 and disables limiting, so it is rejected too.
+func validRate(f float64) bool { return f > 0 && f < float64(rate.Inf) && !math.IsNaN(f) }
 
 // Validate checks enabled limits against the largest accepted blob.
 func (c LimitsConfig) Validate(maxBlob int64) error {
 	if !c.Enabled {
 		return nil
 	}
-	if !positiveFinite(c.RequestsPerSec) || c.RequestBurst <= 0 {
+	if !validRate(c.RequestsPerSec) || c.RequestBurst <= 0 {
 		return fmt.Errorf("limits: requests_per_sec must be finite and > 0 and request_burst > 0")
 	}
-	if !positiveFinite(c.WritesPerSec) || c.WriteBurst <= 0 || c.WriteBytesPerSec <= 0 {
+	if !validRate(c.WritesPerSec) || c.WriteBurst <= 0 || c.WriteBytesPerSec <= 0 {
 		return fmt.Errorf("limits: writes_per_sec must be finite and > 0, write_burst and write_bytes_per_sec > 0")
 	}
 	if min := max(maxBlob, minEntryQuotaBytes); c.WriteBytesBurst < min {
 		return fmt.Errorf("limits: write_bytes_burst must be >= %d (max_blob_bytes and the minimum entry charge)", min)
+	}
+	if c.WriteBytesBurst > maxByteTokens {
+		return fmt.Errorf("limits: write_bytes_burst must be <= %d", int64(maxByteTokens))
 	}
 	if c.MaxTenants <= 0 {
 		return fmt.Errorf("limits: max_tenants must be > 0")
@@ -68,40 +79,16 @@ func (c LimitsConfig) Validate(maxBlob int64) error {
 	return nil
 }
 
-// bucket is a token bucket. tokens is valid as of last.
-type bucket struct {
-	tokens float64
-	last   time.Time
-}
-
-func (b *bucket) refill(now time.Time, rate, burst float64) {
-	if dt := now.Sub(b.last).Seconds(); dt > 0 {
-		b.tokens = math.Min(burst, b.tokens+dt*rate)
-	}
-	b.last = now
-}
-
-// wait is how long until the bucket holds cost tokens. It is positive
-// whenever the bucket is short, even for extreme rates.
-func (b *bucket) wait(cost, rate float64) time.Duration {
-	if b.tokens >= cost {
-		return 0
-	}
-	secs := (cost - b.tokens) / rate
-	if !(secs < float64(math.MaxInt64)/float64(time.Second)) {
-		return time.Duration(math.MaxInt64)
-	}
-	return max(time.Duration(secs*float64(time.Second)), time.Nanosecond)
-}
-
-type tenant struct{ ops, bytes bucket }
+type tenant struct{ ops, bytes *rate.Limiter }
 
 // Limiter applies LimitsConfig. A nil *Limiter admits everything.
 type Limiter struct {
-	cfg       LimitsConfig
-	now       func() time.Time
+	cfg LimitsConfig
+	now func() time.Time
+	// mu serializes reserve and cancel so a rejected admission refunds its
+	// tokens before any other admission sees the buckets.
 	mu        sync.Mutex
-	req       bucket
+	req       *rate.Limiter
 	tenants   map[string]*tenant
 	lastSweep time.Time
 }
@@ -111,9 +98,30 @@ func NewLimiter(c LimitsConfig) *Limiter {
 	if !c.Enabled {
 		return nil
 	}
-	l := &Limiter{cfg: c, now: time.Now, tenants: map[string]*tenant{}}
-	l.req = bucket{tokens: float64(c.RequestBurst), last: l.now()}
-	return l
+	return &Limiter{
+		cfg:     c,
+		now:     time.Now,
+		req:     rate.NewLimiter(rate.Limit(c.RequestsPerSec), c.RequestBurst),
+		tenants: map[string]*tenant{},
+	}
+}
+
+// reserve takes n tokens from each limiter only if all have them now. It
+// returns the longest delay otherwise. The caller holds l.mu.
+func reserve(now time.Time, lims []*rate.Limiter, ns []int) (time.Duration, bool) {
+	rs := make([]*rate.Reservation, len(lims))
+	var wait time.Duration
+	for i, lim := range lims {
+		rs[i] = lim.ReserveN(now, ns[i])
+		wait = max(wait, rs[i].DelayFrom(now))
+	}
+	if wait == 0 {
+		return 0, true
+	}
+	for _, r := range rs {
+		r.CancelAt(now)
+	}
+	return wait, false
 }
 
 // AdmitRequest takes one token from the global request bucket.
@@ -123,12 +131,7 @@ func (l *Limiter) AdmitRequest() (time.Duration, bool) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.req.refill(l.now(), l.cfg.RequestsPerSec, float64(l.cfg.RequestBurst))
-	if w := l.req.wait(1, l.cfg.RequestsPerSec); w > 0 {
-		return w, false
-	}
-	l.req.tokens--
-	return 0, true
+	return reserve(l.now(), []*rate.Limiter{l.req}, []int{1})
 }
 
 // AdmitWrite charges a write of size bytes to namespace. Tokens are not
@@ -137,35 +140,28 @@ func (l *Limiter) AdmitWrite(namespace string, size int64) (time.Duration, bool)
 	if l == nil {
 		return 0, true
 	}
-	c := l.cfg
-	opBurst, byteBurst := float64(c.WriteBurst), float64(c.WriteBytesBurst)
-	byteRate := float64(c.WriteBytesPerSec)
-	cost := float64(max(size, minEntryQuotaBytes))
-	if cost > byteBurst {
-		return time.Minute, false
+	cost := max(size, minEntryQuotaBytes)
+	if cost > l.cfg.WriteBytesBurst {
+		return rate.InfDuration, false
 	}
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	t := l.tenants[namespace]
 	if t == nil {
-		if len(l.tenants) >= c.MaxTenants {
+		if len(l.tenants) >= l.cfg.MaxTenants {
 			l.sweepLocked(now)
 		}
-		if len(l.tenants) >= c.MaxTenants {
+		if len(l.tenants) >= l.cfg.MaxTenants {
 			return time.Second, false
 		}
-		t = &tenant{ops: bucket{opBurst, now}, bytes: bucket{byteBurst, now}}
+		t = &tenant{
+			ops:   rate.NewLimiter(rate.Limit(l.cfg.WritesPerSec), l.cfg.WriteBurst),
+			bytes: rate.NewLimiter(rate.Limit(l.cfg.WriteBytesPerSec), int(l.cfg.WriteBytesBurst)),
+		}
 		l.tenants[namespace] = t
 	}
-	t.ops.refill(now, c.WritesPerSec, opBurst)
-	t.bytes.refill(now, byteRate, byteBurst)
-	if w := max(t.ops.wait(1, c.WritesPerSec), t.bytes.wait(cost, byteRate)); w > 0 {
-		return w, false
-	}
-	t.ops.tokens--
-	t.bytes.tokens -= cost
-	return 0, true
+	return reserve(now, []*rate.Limiter{t.ops, t.bytes}, []int{1, int(cost)})
 }
 
 // sweepLocked drops tenants whose buckets have fully refilled, which carry
@@ -175,11 +171,8 @@ func (l *Limiter) sweepLocked(now time.Time) {
 		return
 	}
 	l.lastSweep = now
-	opBurst, byteBurst := float64(l.cfg.WriteBurst), float64(l.cfg.WriteBytesBurst)
 	for ns, t := range l.tenants {
-		t.ops.refill(now, l.cfg.WritesPerSec, opBurst)
-		t.bytes.refill(now, float64(l.cfg.WriteBytesPerSec), byteBurst)
-		if t.ops.tokens >= opBurst && t.bytes.tokens >= byteBurst {
+		if t.ops.TokensAt(now) >= float64(t.ops.Burst()) && t.bytes.TokensAt(now) >= float64(t.bytes.Burst()) {
 			delete(l.tenants, ns)
 		}
 	}
@@ -196,7 +189,7 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// writeLimited sends 429 with Retry-After rounded up to whole seconds.
+// writeLimited sends 429 with Retry-After in whole seconds, at least 1.
 func writeLimited(w http.ResponseWriter, wait time.Duration, msg string) {
 	secs := max(int64(math.Ceil(wait.Seconds())), 1)
 	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))

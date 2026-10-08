@@ -13,6 +13,7 @@ require (
 	github.com/grafana/s3-mock v0.2.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/zeebo/blake3 v0.2.4
+	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
