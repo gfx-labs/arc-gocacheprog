@@ -5,7 +5,7 @@ name: arcgocache
 
 services:
   postgres:
-    image: postgres:17
+    image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3 # 17.11, multi-arch index
     environment:
       POSTGRES_USER: arcgocache
       POSTGRES_PASSWORD: arcgocache
@@ -19,7 +19,7 @@ services:
       retries: 30
 
   seaweedfs:
-    image: chrislusf/seaweedfs
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d # github.com/seaweedfs/seaweedfs release 4.48
     command: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
     volumes:
       - seaweed:/data
@@ -36,6 +36,15 @@ services:
       - ./config.compose.yaml:/etc/arc-gocacheprog/config.yaml:ro
     ports:
       - "127.0.0.1:${SERVER_PORT:-8080}:8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Upload spool (os.TempDir). tmpfs is RAM-backed, so it is capped well below
+    # the default worst case (32 concurrent uploads x 1 GiB max blob). Uploads
+    # that overflow it fail with ENOSPC instead of exhausting host memory.
+    tmpfs:
+      - /tmp:size=1g,mode=1777,noexec,nosuid,nodev
     depends_on:
       postgres:
         condition: service_healthy
