@@ -243,6 +243,40 @@ func TestQuotaProtectsDefaultRefs(t *testing.T) {
 	}
 }
 
+// Empty entries are charged a minimum quota cost, so a writer cannot pile up
+// unlimited zero-byte entries under the namespace quota.
+func TestQuotaChargesEmptyEntries(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	r := remote(e, testKey)
+	empty := newBlob(t, 0)
+	const n = 5
+	for i := range n {
+		if err := put(t, r, action(fmt.Sprint("e", i)), empty); err != nil {
+			t.Fatal(err)
+		}
+		// Higher i is more recently accessed.
+		if _, err := e.Store.Pool().Exec(ctx, `UPDATE entries SET accessed_at = now() - make_interval(mins => $2)
+			WHERE action_id = $1`, action(fmt.Sprint("e", i)), n-i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gc := server.NewGC(server.GCConfig{NamespaceMaxBytes: 1024, BlobGrace: time.Hour}, e.Store, e.Blobs, nil)
+	if _, err := gc.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := e.Store.Pool().QueryRow(ctx, "SELECT count(*) FROM entries").Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 1 {
+		t.Fatalf("expected 1 entry within quota, got %d", left)
+	}
+	if got, err := get(t, r, action(fmt.Sprint("e", n-1))); err != nil || got == nil {
+		t.Fatalf("newest entry was evicted: %v", err)
+	}
+}
+
 func TestMissingObjectHeals(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()

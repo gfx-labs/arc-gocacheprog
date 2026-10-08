@@ -12,6 +12,11 @@ import (
 
 const gcBatch = 500
 
+// minEntryQuotaBytes is the least an entry counts against the namespace
+// quota, so empty or tiny entries cannot grow the entries table unbounded.
+// Quota accounting is a charge, not exact physical storage.
+const minEntryQuotaBytes = 1024
+
 // GCStats reports what one GC pass removed.
 type GCStats struct {
 	ExpiredEntries int64
@@ -127,7 +132,8 @@ func (g *GC) expireEntries(ctx context.Context) (int64, error) {
 // evictOverQuota deletes entries in namespaces whose total entry size
 // exceeds the quota. Entries in protected scopes are kept over others, then
 // most recently accessed first. Sizes are logical, so a blob shared by two
-// entries counts twice. Deletes run in batches.
+// entries counts twice, and each entry is charged at least
+// minEntryQuotaBytes. Deletes run in batches.
 func (g *GC) evictOverQuota(ctx context.Context) (int64, error) {
 	protected := g.cfg.ProtectedScopes
 	if protected == nil {
@@ -139,7 +145,7 @@ func (g *GC) evictOverQuota(ctx context.Context) (int64, error) {
 			DELETE FROM entries e USING (
 				SELECT namespace, scope, action_id FROM (
 					SELECT namespace, scope, action_id,
-					       sum(size) OVER (PARTITION BY namespace
+					       sum(GREATEST(size, $4::bigint)) OVER (PARTITION BY namespace
 					                       ORDER BY (scope = ANY($2)) DESC, accessed_at DESC,
 					                                created_at DESC, scope, action_id) AS running
 					FROM entries
@@ -147,7 +153,7 @@ func (g *GC) evictOverQuota(ctx context.Context) (int64, error) {
 				LIMIT $3
 			) v
 			WHERE e.namespace = v.namespace AND e.scope = v.scope AND e.action_id = v.action_id`,
-			g.cfg.NamespaceMaxBytes, protected, gcBatch)
+			g.cfg.NamespaceMaxBytes, protected, gcBatch, minEntryQuotaBytes)
 		if err != nil {
 			return total, err
 		}
