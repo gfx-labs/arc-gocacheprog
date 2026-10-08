@@ -43,6 +43,8 @@ type RemoteEntry struct {
 type StatusError struct {
 	Code int
 	Msg  string
+	// RetryAfter is the parsed Retry-After header, 0 when absent.
+	RetryAfter time.Duration
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("server returned %d: %s", e.Code, e.Msg) }
@@ -78,7 +80,24 @@ func readErr(resp *http.Response) error {
 	if json.Unmarshal(b, &eb) == nil && eb.Error != "" {
 		msg = eb.Error
 	}
-	return &StatusError{Code: resp.StatusCode, Msg: msg}
+	return &StatusError{Code: resp.StatusCode, Msg: msg, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+}
+
+// parseRetryAfter accepts delay seconds or an HTTP date.
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(min(secs, int64(math.MaxInt64/time.Second))) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return max(time.Until(t), 0)
+	}
+	return 0
 }
 
 // Get fetches actionID. On a hit it writes the body to w and returns the

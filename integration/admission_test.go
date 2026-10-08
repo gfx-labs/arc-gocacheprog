@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -90,5 +91,28 @@ func TestRequestAdmission(t *testing.T) {
 	}
 	if codes[0] != 200 || codes[1] != 200 || codes[2] != http.StatusTooManyRequests {
 		t.Fatalf("unexpected status codes %v", codes)
+	}
+}
+
+// Uploads rejected by the write rate limit are retried until they land
+// instead of being dropped after a few seconds.
+func TestClientRetriesThrottledUploads(t *testing.T) {
+	e := newEnv(t, func(c *server.Config) {
+		c.Limits.WriteBurst = 2
+		c.Limits.WritesPerSec = 4
+	})
+	puts := map[string][]byte{}
+	for i := range 6 {
+		puts[fmt.Sprint("throttled", i)] = newBlob(t, 2048).data
+	}
+	r := remote(e, testKey)
+	_, p := runSession(t, t.TempDir(), r, cacheSession{puts: puts})
+	if n := p.Stats.UploadErrs.Load(); n != 0 {
+		t.Fatalf("%d uploads failed", n)
+	}
+	for name, body := range puts {
+		if got, err := get(t, r, action(name)); err != nil || !bytes.Equal(got, body) {
+			t.Fatalf("%s not stored: err=%v", name, err)
+		}
 	}
 }

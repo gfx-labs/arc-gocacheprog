@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -83,6 +84,13 @@ type Prog struct {
 	consecErrs     atomic.Int64
 	readDisabled   atomic.Bool
 	writeDisabled  atomic.Bool
+
+	// pauseUntil is the unix nano time before which no upload starts, set
+	// when the server throttles. Shared so all workers back off together.
+	pauseUntil atomic.Int64
+	// stopCtx is cancelled when the close wait for uploads runs out.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 }
 
 type upload struct {
@@ -114,12 +122,15 @@ func New(opts Options) (*Prog, error) {
 		opts.Log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	}
 	p := &Prog{opts: opts, log: opts.Log}
+	p.stopCtx, p.stopCancel = context.WithCancel(context.Background())
 	if err := p.selectRoot(); err != nil {
+		p.stopCancel()
 		return nil, err
 	}
 	for _, d := range []string{"o", "a", "tmp"} {
 		if err := os.MkdirAll(filepath.Join(p.root, d), 0o700); err != nil {
 			p.removeSession()
+			p.stopCancel()
 			return nil, err
 		}
 	}
@@ -229,6 +240,10 @@ func (p *Prog) noteRemote(err error) {
 	if IsAuthError(err) {
 		return
 	}
+	if isThrottle(err) {
+		// The server is up and asking for less traffic.
+		return
+	}
 	if n := p.consecErrs.Add(1); n >= int64(p.opts.MaxErrors) && p.remoteDisabled.CompareAndSwap(false, true) {
 		p.log.Warn("disabling remote cache after repeated errors", "errors", n, "last", err)
 	}
@@ -309,6 +324,8 @@ func (p *Prog) stop() {
 		}
 		p.uploads = nil
 	}
+	// Cancels uploads still running after the close wait.
+	p.stopCancel()
 	// After a CloseTimeout, uploaders may still read files here. Removing
 	// them makes those uploads fail; the server never stores unverified bodies.
 	p.removeSession()
@@ -421,6 +438,9 @@ func (p *Prog) handleGet(ctx context.Context, req *Request) *Response {
 	}
 	res, err := p.remoteGet(ctx, req)
 	p.noteRemote(err)
+	// Gets are on the build's critical path and are not retried, but a
+	// throttled get still slows the uploaders.
+	p.notePause(err, 0)
 	if err != nil {
 		p.Stats.RemoteGetErrs.Add(1)
 		if IsAuthError(err) && p.readDisabled.CompareAndSwap(false, true) {
@@ -559,9 +579,12 @@ func (p *Prog) uploader() {
 }
 
 func (p *Prog) doUpload(u upload) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	linked, err := p.opts.Remote.Link(ctx, u.actionID, u.outputID, u.blake3, u.size)
+	var linked bool
+	err := p.retryThrottled(func(ctx context.Context) error {
+		var err error
+		linked, err = p.opts.Remote.Link(ctx, u.actionID, u.outputID, u.blake3, u.size)
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -569,18 +592,104 @@ func (p *Prog) doUpload(u upload) error {
 		p.Stats.Linked.Add(1)
 		return nil
 	}
-	var perr error
-	for attempt := range 4 {
-		perr = p.opts.Remote.Put(ctx, u.actionID, u.outputID, u.blake3, u.size, u.path)
-		if statusOf(perr) != http.StatusServiceUnavailable {
-			break
-		}
-		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-	}
-	if perr != nil {
-		return perr
+	err = p.retryThrottled(func(ctx context.Context) error {
+		return p.opts.Remote.Put(ctx, u.actionID, u.outputID, u.blake3, u.size, u.path)
+	})
+	if err != nil {
+		return err
 	}
 	p.Stats.Uploads.Add(1)
 	p.Stats.BytesUp.Add(u.size)
 	return nil
+}
+
+const (
+	uploadAttemptTimeout = 10 * time.Minute
+	throttleBaseDelay    = 500 * time.Millisecond
+	throttleMaxDelay     = 30 * time.Second
+	// throttleMaxRetryAfter bounds a server-sent Retry-After. The close
+	// wait still ends retries at shutdown.
+	throttleMaxRetryAfter = 10 * time.Minute
+)
+
+// retryThrottled runs fn until it returns something other than a throttle
+// response. It honors Retry-After and the shared pause, and gives up only
+// when the close wait for uploads runs out.
+func (p *Prog) retryThrottled(fn func(context.Context) error) error {
+	for attempt := 0; ; attempt++ {
+		if err := p.waitPause(); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(p.stopCtx, uploadAttemptTimeout)
+		err := fn(ctx)
+		cancel()
+		if !isThrottle(err) {
+			return err
+		}
+		d := p.notePause(err, attempt)
+		p.log.Debug("server throttled upload, retrying", "attempt", attempt+1, "delay", d, "err", err)
+	}
+}
+
+// waitPause sleeps until the shared pause ends or the close wait runs out.
+func (p *Prog) waitPause() error {
+	for {
+		d := time.Until(time.Unix(0, p.pauseUntil.Load()))
+		if d <= 0 {
+			return nil
+		}
+		t := time.NewTimer(d)
+		select {
+		case <-t.C:
+		case <-p.stopCtx.Done():
+			t.Stop()
+			return fmt.Errorf("gave up on throttled upload at shutdown: %w", p.stopCtx.Err())
+		}
+	}
+}
+
+// notePause extends the shared pause after a throttle response and returns
+// the delay chosen. attempt is the number of earlier throttled tries.
+func (p *Prog) notePause(err error, attempt int) time.Duration {
+	if !isThrottle(err) {
+		return 0
+	}
+	d := throttleDelay(retryAfter(err), attempt)
+	until := time.Now().Add(d).UnixNano()
+	for {
+		cur := p.pauseUntil.Load()
+		if cur >= until || p.pauseUntil.CompareAndSwap(cur, until) {
+			return d
+		}
+	}
+}
+
+// throttleDelay is exponential backoff from throttleBaseDelay, at least the
+// server's Retry-After (capped at throttleMaxRetryAfter), plus up to 50%
+// jitter so workers do not retry in step.
+func throttleDelay(retryAfter time.Duration, attempt int) time.Duration {
+	d := throttleMaxDelay
+	if attempt < 16 {
+		d = min(throttleBaseDelay<<attempt, throttleMaxDelay)
+	}
+	d = max(d, min(retryAfter, throttleMaxRetryAfter))
+	return d + rand.N(d/2+1)
+}
+
+// isThrottle reports a 429, or a 503 carrying Retry-After. A 503 without
+// Retry-After is an outage, not a request to slow down.
+func isThrottle(err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Code == http.StatusTooManyRequests || (se.Code == http.StatusServiceUnavailable && se.RetryAfter > 0)
+}
+
+func retryAfter(err error) time.Duration {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.RetryAfter
+	}
+	return 0
 }
