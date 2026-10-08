@@ -36,6 +36,16 @@ auth:
 		{"negative namespace quota", "gc:\n  namespace_max_bytes: -1\n", "gc.namespace_max_bytes"},
 		{"negative entry ttl", "gc:\n  entry_ttl: -1s\n", "gc.entry_ttl"},
 		{"negative touch interval", "storage:\n  touch_interval: -1s\n", "storage.touch_interval"},
+		{"unbounded request burst", "limits:\n  request_burst: 0\n", "request_burst"},
+		{"invalid request rate", "limits:\n  requests_per_sec: .nan\n", "requests_per_sec"},
+		{"unbounded write burst", "limits:\n  write_burst: 0\n", "write_burst"},
+		{"invalid write rate", "limits:\n  writes_per_sec: .inf\n", "writes_per_sec"},
+		{"upload above byte burst", "limits:\n  write_bytes_burst: 1024\n", "write_bytes_burst"},
+		{"unbounded tenant map", "limits:\n  max_tenants: 0\n", "max_tenants"},
+		{"plaintext OIDC discovery", "  gha:\n    allowed_owners: [gfx-labs]\n    issuer: http://issuer.example.com\n", "auth.gha.issuer"},
+		{"plaintext signing keys", "  gha:\n    allowed_owners: [gfx-labs]\n    jwks_url: http://keys.example.com/jwks\n", "auth.gha.jwks_url"},
+		{"plaintext runtime signing keys", "  gha:\n    allowed_owners: [gfx-labs]\n    runtime_token_jwks_url: http://keys.example.com/jwks\n", "auth.gha.runtime_token_jwks_url"},
+		{"runtime writes without runtime auth", "  gha:\n    allowed_owners: [gfx-labs]\n    allow_runtime_token_writes: true\n", "allow_runtime_token_writes"},
 		{"multiple YAML documents", "---\nlisten: ':9090'\n", "document"},
 	}
 	for _, tc := range cases {
@@ -53,6 +63,7 @@ auth:
 
 func TestConfigResourceBoundaries(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.Limits = LimitsConfig{}
 	cfg.DatabaseURL = "postgres://localhost/cache"
 	cfg.S3.Bucket = "cache"
 	cfg.Auth.Static = []StaticKey{{Key: "test-key", Namespace: "test", WriteScope: "main"}}

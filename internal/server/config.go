@@ -16,12 +16,13 @@ import (
 // Config is the server configuration. String values in the YAML file have
 // ${ENV} references expanded before parsing.
 type Config struct {
-	Listen      string   `yaml:"listen"`
-	DatabaseURL string   `yaml:"database_url"`
-	S3          S3Config `yaml:"s3"`
-	Auth        Auth     `yaml:"auth"`
-	Storage     Storage  `yaml:"storage"`
-	GC          GCConfig `yaml:"gc"`
+	Listen      string       `yaml:"listen"`
+	DatabaseURL string       `yaml:"database_url"`
+	S3          S3Config     `yaml:"s3"`
+	Auth        Auth         `yaml:"auth"`
+	Storage     Storage      `yaml:"storage"`
+	GC          GCConfig     `yaml:"gc"`
+	Limits      LimitsConfig `yaml:"limits"`
 }
 
 type S3Config struct {
@@ -105,6 +106,8 @@ type GHAConfig struct {
 	WriteEvents []string `yaml:"write_events"`
 	// AcceptRuntimeToken accepts ACTIONS_RUNTIME_TOKEN (scopes from the "ac" claim).
 	AcceptRuntimeToken bool `yaml:"accept_runtime_token"`
+	// AllowRuntimeTokenWrites separately opts in to signed runtime write scopes.
+	AllowRuntimeTokenWrites bool `yaml:"allow_runtime_token_writes"`
 	// RuntimeTokenIssuers is the set of issuers accepted for runtime tokens.
 	// Empty means only Issuer. Runtime tokens are verified with the issuer's
 	// JWKS unless RuntimeTokenJWKSURL is set.
@@ -126,6 +129,7 @@ type StaticKey struct {
 func DefaultConfig() Config {
 	return Config{
 		Listen: ":8080",
+		Limits: DefaultLimits(),
 		S3: S3Config{
 			Region: "us-east-1",
 			Prefix: "gocache/",
@@ -197,6 +201,9 @@ func (c *Config) Validate() error {
 		if !g.AllowAnyOwner && len(g.AllowedOwners) == 0 && len(g.AllowedOwnerIDs) == 0 && len(g.AllowedRepositories) == 0 {
 			return fmt.Errorf("auth.gha needs allowed_owner_ids, allowed_owners, allowed_repositories, or allow_any_owner: true")
 		}
+		if err := validateGHAURLs(*g); err != nil {
+			return err
+		}
 	}
 	for i, k := range c.Auth.Static {
 		if k.Key == "" && k.KeySHA256 == "" {
@@ -245,6 +252,12 @@ func (c *Config) Validate() error {
 	}
 	if c.GC.Enabled && c.GC.Interval <= 0 {
 		return fmt.Errorf("gc.interval must be > 0")
+	}
+	if err := c.Limits.Validate(c.Storage.MaxBlobBytes); err != nil {
+		return err
+	}
+	if g := c.Auth.GHA; g != nil && g.AllowRuntimeTokenWrites && !g.AcceptRuntimeToken {
+		return fmt.Errorf("auth.gha.allow_runtime_token_writes requires accept_runtime_token")
 	}
 	return nil
 }
