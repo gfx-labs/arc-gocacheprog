@@ -77,6 +77,7 @@ type Prog struct {
 	uploads  chan upload
 	uploadWG sync.WaitGroup
 	inflight sync.WaitGroup
+	stopOnce sync.Once
 
 	remoteDisabled atomic.Bool
 	consecErrs     atomic.Int64
@@ -233,9 +234,11 @@ func (p *Prog) noteRemote(err error) {
 	}
 }
 
-// Run serves the protocol until close or EOF.
+// Run serves the protocol until close, EOF or a protocol error. Every return
+// waits for in-flight gets, drains queued uploads (bounded by CloseTimeout)
+// and removes a session partition.
 func (p *Prog) Run(ctx context.Context, in io.Reader, out io.Writer) error {
-	defer p.removeSession()
+	defer p.shutdown()
 	p.out = bufio.NewWriter(out)
 	if err := p.send(&Response{ID: 0, KnownCommands: []Cmd{CmdGet, CmdPut, CmdClose}}); err != nil {
 		return err
@@ -244,7 +247,6 @@ func (p *Prog) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 	for {
 		req, err := r.next()
 		if errors.Is(err, io.EOF) {
-			p.shutdown()
 			return nil
 		}
 		if err != nil {
@@ -265,7 +267,8 @@ func (p *Prog) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 			}
 			p.send(res) //nolint:errcheck
 		case CmdClose:
-			p.inflight.Wait()
+			// Uploads finish before the close response, so cmd/go does not
+			// exit while they are pending.
 			p.shutdown()
 			return p.send(&Response{ID: req.ID})
 		default:
@@ -290,7 +293,10 @@ func (p *Prog) send(res *Response) error {
 	return p.out.Flush()
 }
 
-func (p *Prog) shutdown() {
+// shutdown runs once per Prog.
+func (p *Prog) shutdown() { p.stopOnce.Do(p.stop) }
+
+func (p *Prog) stop() {
 	p.inflight.Wait()
 	if p.uploads != nil {
 		close(p.uploads)
@@ -303,6 +309,8 @@ func (p *Prog) shutdown() {
 		}
 		p.uploads = nil
 	}
+	// After a CloseTimeout, uploaders may still read files here. Removing
+	// them makes those uploads fail; the server never stores unverified bodies.
 	p.removeSession()
 	s := &p.Stats
 	if p.opts.Remote != nil {

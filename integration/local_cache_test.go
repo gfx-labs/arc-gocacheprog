@@ -137,3 +137,24 @@ func TestLocalCacheUnknownIdentityUsesSession(t *testing.T) {
 		t.Fatalf("session entry kept after close: %v", err)
 	}
 }
+
+// A protocol error from cmd/go still drains queued uploads before Run returns.
+func TestRunProtocolErrorDrainsUploads(t *testing.T) {
+	e := newEnv(t)
+	r := remote(e, testKey)
+	p, err := client.New(client.Options{Dir: t.TempDir(), Remote: r, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte("x"), 64<<10)
+	sum := sha256.Sum256(body)
+	var in bytes.Buffer
+	json.NewEncoder(&in).Encode(client.Request{ID: 1, Command: client.CmdPut, ActionID: action("drained"), OutputID: sum[:], BodySize: int64(len(body))}) //nolint:errcheck
+	fmt.Fprintf(&in, "%q\n{not json\n", base64.StdEncoding.EncodeToString(body))
+	if err := p.Run(context.Background(), &in, io.Discard); err == nil {
+		t.Fatal("expected protocol error")
+	}
+	if got, err := get(t, r, action("drained")); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("upload not finished when Run returned: err=%v len=%d", err, len(got))
+	}
+}
