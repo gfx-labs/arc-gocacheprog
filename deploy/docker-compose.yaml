@@ -40,9 +40,9 @@ services:
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    # Upload spool (os.TempDir). tmpfs is RAM-backed, so it is capped well below
-    # the default worst case (32 concurrent uploads x 1 GiB max blob). Uploads
-    # that overflow it fail with ENOSPC instead of exhausting host memory.
+    # Upload spool (os.TempDir), RAM-backed. config.compose.yaml caps peak spool
+    # at 8 uploads x 16 MiB = 128 MiB. Keep this size above that product if the
+    # limits change. The built-in defaults (32 x 1 GiB) would not fit.
     tmpfs:
       - /tmp:size=1g,mode=1777,noexec,nosuid,nodev
     depends_on:
