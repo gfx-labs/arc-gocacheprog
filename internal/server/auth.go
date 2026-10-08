@@ -77,7 +77,14 @@ func NewAuthenticator(cfg Auth) (*Authenticator, error) {
 		a.static = append(a.static, e)
 	}
 	if cfg.GHA != nil {
-		a.gha = newGHAAuth(*cfg.GHA)
+		g := *cfg.GHA
+		if g.Issuer == "" {
+			g.Issuer = "https://token.actions.githubusercontent.com"
+		}
+		if err := validateGHAURLs(g); err != nil {
+			return nil, err
+		}
+		a.gha = newGHAAuth(g)
 	}
 	return a, nil
 }
@@ -215,14 +222,21 @@ func (g *ghaAuth) keySet(ctx context.Context, issuer string) (oidc.KeySet, error
 			return nil, e.lastErr
 		}
 	}
-	// The key set refreshes on unknown kids using this context's client.
-	e.keys = oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), httpClient), url)
+	// Discovered JWKS URLs must be HTTPS (or loopback) like configured ones.
+	if err := validateAuthURL(url); err != nil {
+		e.lastErr = fmt.Errorf("jwks url for %s: %w", issuer, err)
+		e.failedAt = time.Now()
+		return nil, e.lastErr
+	}
+	// The key set refreshes on unknown kids. The JWKS client rate limits
+	// upstream fetches so forged kids cannot hammer the issuer.
+	e.keys = oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), newJWKSClient()), url)
 	e.lastErr = nil
 	return e.keys, nil
 }
 
 // httpClient bounds JWKS and discovery requests.
-var httpClient = &http.Client{Timeout: discoveryTimeout}
+var httpClient = &http.Client{Timeout: discoveryTimeout, CheckRedirect: authRedirect}
 
 func (g *ghaAuth) verify(ctx context.Context, raw, issuer string, audience bool) (*ghaClaims, error) {
 	ks, err := g.keySet(ctx, issuer)
@@ -347,7 +361,9 @@ func (g *ghaAuth) authenticateRuntime(ctx context.Context, raw, issuer string) (
 		if s.Scope == "" {
 			continue
 		}
-		if s.Permission&2 != 0 && id.WriteScope == "" {
+		// Write grants are ignored unless enabled, since some GitHub setups
+		// grant untrusted triggers write access to the default branch scope.
+		if s.Permission&2 != 0 && id.WriteScope == "" && g.cfg.AllowRuntimeTokenWrites {
 			id.WriteScope = s.Scope
 		}
 		if s.Permission&1 != 0 && !slices.Contains(id.ReadScopes, s.Scope) {

@@ -37,11 +37,13 @@ Blobs are content addressed by BLAKE3-256. Object keys are `<prefix><h[0:2]>/<h[
 - **Scopes.** Like `actions/cache`, every entry is written to a scope. The write scope is the ref in the token (for example `refs/heads/feature`). A job can read its own ref, the PR base ref, and the configured `default_refs`. A job can never write to a scope other than its own ref.
 - **PR isolation.** A pull request job writes only to its own ref (`refs/pull/N/merge`), which other branches cannot read. It reads the base branch and the default refs.
 - **Event allowlist.** Only workflow events listed in `gha.write_events` may write (default: `push`, `pull_request`, `merge_group`, `workflow_dispatch`, `schedule`). Tokens from other events can read but not write. `pull_request_target`, `workflow_run` and `issue_comment` run with the default branch as ref while often building untrusted code, so they are read only.
-- **Owner allowlist.** `allowed_owner_ids` (preferred, names can be re-registered), `allowed_owners` and `allowed_repositories` restrict which repositories can use the server. A config that allows no one is rejected unless `allow_any_owner: true` is set.
+- **Owner allowlist.** `allowed_owner_ids` (preferred, names can be re-registered), `allowed_owners` and `allowed_repositories` restrict which repositories can use the server. A config that allows no one is rejected unless `allow_any_owner: true` is set. The repository allowlist still applies when any owner is allowed.
 - **OutputID verification.** Go entries map an action ID to an output ID, which is the SHA-256 of the output file. The server hashes the uploaded body and rejects the upload if the SHA-256 does not match the claimed output ID. The client rechecks the SHA-256 of downloaded bodies before handing them to `go`.
 - **BLAKE3 dedup.** The server computes the BLAKE3 hash of the uploaded body itself and does not trust the client's claim. Blobs are shared across namespaces on disk, but access goes through per-namespace references.
 - **Link endpoint.** `POST .../link` succeeds only when the blob is already referenced by an entry in a scope the caller can read, and the size and SHA-256 match. A client cannot claim a blob it only knows the hash of, or one that belongs to another branch or repository.
-- **Tokens.** OIDC ID tokens are verified against the issuer's JWKS, with the configured audience, RS256 only. Error responses do not include verification details. `ACTIONS_RUNTIME_TOKEN` is accepted only when `accept_runtime_token` is on, and its scopes come from the `ac` claim. Static keys are matched by SHA-256, so the config does not need to hold the plaintext key.
+- **Tokens.** OIDC ID tokens are verified against the issuer's JWKS, with the configured audience, RS256 only. Discovery and signing-key endpoints require HTTPS except loopback development URLs. Error responses do not include verification details. JWKS refreshes are limited to one upstream request per issuer every 30 seconds, with a 1 MiB response limit. Point custom `jwks_url` settings directly at the final endpoint, not a redirect. `ACTIONS_RUNTIME_TOKEN` is accepted only when `accept_runtime_token` is on. It is read-only unless `allow_runtime_token_writes` is explicitly enabled.
+- **Admission controls.** The server limits concurrent uploads globally and per namespace. Enabled `limits` also bound all HTTP request rates and per-namespace write operations and uploaded bytes before spooling. Excess requests return 429 or 503. Rate limits are per replica and reset on restart.
+- **Local cache.** Remote-mode entries are partitioned by the server URL and the namespace and scopes returned by authenticated `whoami`. Old unpartitioned entries are not reused. If identity verification fails, the client uses a private session directory rather than a previous build's cache. Local-only mode has a separate partition.
 
 ## GitHub Actions usage
 
@@ -81,7 +83,9 @@ Client environment variables:
 | `ARC_GOCACHE_READONLY` | `1` disables uploads. |
 | `ARC_GOCACHE_VERBOSE` | `1` logs a stats line and warnings, `2` logs debug. |
 
-`arc-gocacheprog -whoami` prints the identity the server assigns to the current token.
+`arc-gocacheprog -whoami` prints the identity the server assigns to the current token. Remote cache and OIDC token endpoints must use HTTPS, except loopback HTTP for local development. Authenticated redirects cannot change the original origin.
+
+Use ephemeral runners for untrusted CI jobs. Local identity partitioning prevents accidental cross-repository or cross-scope reuse, but it cannot protect files from malicious jobs running as the same OS user. `ARC_GOCACHE_READONLY` only disables remote uploads. The initial identity request has a 30-second timeout. A failed identity request uses a fresh session cache that is removed on orderly exit.
 
 ## Local usage with a static key
 
@@ -96,7 +100,7 @@ Then build with the key `dev-key`:
 ```sh
 go install ./cmd/arc-gocacheprog
 GOCACHEPROG=arc-gocacheprog \
-ARC_GOCACHE_URL=http://localhost:8080 \
+ARC_GOCACHE_URL=http://127.0.0.1:8080 \
 ARC_GOCACHE_KEY=dev-key \
 ARC_GOCACHE_VERBOSE=1 \
 go build ./...
@@ -112,7 +116,9 @@ Run the server with a YAML file:
 arc-gocacheprog-server -config config.yaml
 ```
 
-`ARC_GOCACHE_CONFIG` sets the default path. `${VAR}` references in the file are expanded from the environment. [deploy/config.example.yaml](deploy/config.example.yaml) lists every option with comments. Schema migrations run at startup.
+`ARC_GOCACHE_CONFIG` sets the default path. `${VAR}` references in the file are expanded from the environment. Unknown YAML fields and unsafe resource limits are rejected. [deploy/config.example.yaml](deploy/config.example.yaml) lists every option with comments. Schema migrations run at startup.
+
+Read `deploy/SECURITY.md` before production deployment. The server needs a trusted HTTPS proxy, private database and object storage, and storage monitoring. In-process admission limits apply per replica, not across the fleet. Namespace quotas are asynchronous GC policies, not hard storage admission limits.
 
 Container image: `ghcr.io/gfx-labs/arc-gocacheprog`. The default command reads `/etc/arc-gocacheprog/config.yaml`. The image runs as a non-root user on distroless.
 
@@ -121,7 +127,7 @@ Container image: `ghcr.io/gfx-labs/arc-gocacheprog`. The default command reads `
 The server runs GC every `gc.interval` while `gc.enabled` is set. A Postgres lock keeps multiple replicas from running it at once. Each pass does the following:
 
 - Deletes entries whose `accessed_at` is older than `gc.entry_ttl`. Access times are only rewritten when older than `storage.touch_interval`, so the TTL is loose by up to that interval.
-- If `gc.namespace_max_bytes` is set, evicts the least recently used entries in each namespace that is over quota.
+- If `gc.namespace_max_bytes` is set, evicts the least recently used entries in each namespace that is over quota. Each entry counts at least 1024 bytes so empty and tiny entries cannot bypass quota accounting.
 - Deletes blobs with no references once they have been unreferenced for `gc.blob_grace`. The grace period covers uploads that wrote the blob but have not yet written the entry.
 - If `gc.orphan_sweep` is set, lists the bucket and deletes objects that have no blob row.
 

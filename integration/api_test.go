@@ -175,7 +175,7 @@ func unsigned(claims map[string]any) string {
 }
 
 func TestRuntimeTokenScopes(t *testing.T) {
-	e := newEnv(t)
+	e := newEnv(t, func(c *server.Config) { c.Auth.GHA.AllowRuntimeTokenWrites = true })
 	iss := e.RuntimeIssuer
 	rt := func(ac string) *client.Remote {
 		return remote(e, iss.sign(t, map[string]any{
@@ -211,6 +211,19 @@ func TestRuntimeTokenScopes(t *testing.T) {
 	forged := e.Issuer.sign(t, map[string]any{"iss": iss.URL(), "repository_id": "100", "ac": `[{"Scope":"refs/heads/main","Permission":3}]`})
 	if err := put(t, remote(e, forged), action("z"), b); statusCode(err) != 401 {
 		t.Fatalf("runtime token signed with wrong issuer key: expected 401, got %v", err)
+	}
+
+	// Without allow_runtime_token_writes, write grants are ignored.
+	ro := newEnv(t)
+	tok := ro.RuntimeIssuer.sign(t, map[string]any{
+		"repository_id": "100", "repository": "gfx-labs/app",
+		"ac": `[{"Scope":"refs/heads/main","Permission":3}]`,
+	})
+	if err := put(t, remote(ro, tok), action("x"), b); statusCode(err) != 403 {
+		t.Fatalf("runtime write without opt in: expected 403, got %v", err)
+	}
+	if _, err := get(t, remote(ro, tok), action("x")); err != nil {
+		t.Fatalf("runtime read without write opt in: %v", err)
 	}
 }
 
@@ -505,5 +518,28 @@ func TestUploadSlotsPerNamespace(t *testing.T) {
 		if err := put(t, local, action(fmt.Sprint("after", i)), newBlob(t, 64)); err != nil {
 			t.Fatalf("slots not released: %v", err)
 		}
+	}
+}
+
+func TestStalledUploadReleasesSlot(t *testing.T) {
+	e := newEnv(t, func(c *server.Config) {
+		c.Storage.InlineMaxBytes = 0
+		c.Storage.RequestTimeout = 500 * time.Millisecond
+		c.Storage.MaxConcurrentUploadsPerNamespace = 1
+	})
+	// Never finished. The handler deadline must end it and free the slot.
+	h := startPut(t, e, testKey, action("stalled"), newBlob(t, 64))
+	defer h.w.Close()
+	local := remote(e, testKey)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := put(t, local, action("next"), newBlob(t, 64))
+		if err == nil {
+			break
+		}
+		if statusCode(err) != 503 || time.Now().After(deadline) {
+			t.Fatalf("slot held by a stalled upload was not released: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

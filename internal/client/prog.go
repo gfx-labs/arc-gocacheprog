@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,10 +27,15 @@ import (
 
 // Options configures a Prog.
 type Options struct {
-	// Dir is the local disk cache directory. Files returned to cmd/go live here.
+	// Dir is the local disk cache directory. Entries live in a partition of
+	// it chosen from the remote identity, see selectRoot.
 	Dir string
 	// Remote is nil for a local-only cache.
 	Remote *Remote
+	// RemoteUnavailable marks a configured remote that could not be set up,
+	// for example missing credentials. The local cache then uses a temporary
+	// partition instead of the shared local-only one.
+	RemoteUnavailable bool
 	// ReadOnly disables uploads.
 	ReadOnly bool
 	// UploadConcurrency is the number of parallel uploads.
@@ -40,7 +46,9 @@ type Options struct {
 	CloseTimeout time.Duration
 	// MaxErrors disables the remote after this many consecutive failures.
 	MaxErrors int
-	Log       *slog.Logger
+	// IdentityTimeout bounds the whoami call that selects the local partition.
+	IdentityTimeout time.Duration
+	Log             *slog.Logger
 }
 
 // Stats are reported on close.
@@ -57,6 +65,11 @@ type Prog struct {
 	opts  Options
 	log   *slog.Logger
 	Stats Stats
+
+	// root is the local partition in use. session is set when it is a
+	// temporary directory removed at shutdown.
+	root    string
+	session bool
 
 	outMu sync.Mutex
 	out   *bufio.Writer
@@ -93,15 +106,22 @@ func New(opts Options) (*Prog, error) {
 	if opts.MaxErrors <= 0 {
 		opts.MaxErrors = 20
 	}
+	if opts.IdentityTimeout <= 0 {
+		opts.IdentityTimeout = 30 * time.Second
+	}
 	if opts.Log == nil {
 		opts.Log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	}
+	p := &Prog{opts: opts, log: opts.Log}
+	if err := p.selectRoot(); err != nil {
+		return nil, err
+	}
 	for _, d := range []string{"o", "a", "tmp"} {
-		if err := os.MkdirAll(filepath.Join(opts.Dir, d), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(p.root, d), 0o700); err != nil {
+			p.removeSession()
 			return nil, err
 		}
 	}
-	p := &Prog{opts: opts, log: opts.Log}
 	if opts.Remote != nil && !opts.ReadOnly {
 		p.uploads = make(chan upload, 4096)
 		for range opts.UploadConcurrency {
@@ -110,6 +130,90 @@ func New(opts Options) (*Prog, error) {
 		}
 	}
 	return p, nil
+}
+
+// selectRoot picks the local partition. Entries are only reused by a later
+// process that the same server identifies with the same namespace and scopes,
+// so a job cannot get local hits for entries another identity wrote.
+//
+//	<Dir>/local/          local-only mode (no remote configured)
+//	<Dir>/remote/<hash>/  sha256 of server URL and verified identity
+//	<Dir>/session/<rand>/ identity unknown; removed when Run returns
+//
+// Entries at the top of Dir from older versions are never read. Session
+// dirs left by killed processes are not removed automatically, since another
+// live process may own them.
+//
+// With a remote configured, startup waits for one whoami call, bounded by
+// IdentityTimeout (30s default) when the server is unreachable.
+func (p *Prog) selectRoot() error {
+	dir := p.opts.Dir
+	if p.opts.Remote == nil && !p.opts.RemoteUnavailable {
+		p.root = filepath.Join(dir, "local")
+		return nil
+	}
+	err := errors.New("remote cache is not configured correctly")
+	if p.opts.Remote != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), p.opts.IdentityTimeout)
+		defer cancel()
+		var id *api.Identity
+		if id, err = p.opts.Remote.Whoami(ctx); err == nil {
+			var key string
+			if key, err = partitionKey(p.opts.Remote.BaseURL, id); err == nil {
+				p.root = filepath.Join(dir, "remote", key)
+				return nil
+			}
+		}
+	}
+	p.log.Warn("could not resolve cache identity, local cache entries from earlier builds are not used", "err", err)
+	sessions := filepath.Join(dir, "session")
+	if err := os.MkdirAll(sessions, 0o700); err != nil {
+		return err
+	}
+	root, err := os.MkdirTemp(sessions, "s-")
+	if err != nil {
+		return err
+	}
+	p.root, p.session = root, true
+	return nil
+}
+
+// partitionKey hashes the canonical server URL and the identity the server
+// verified. Tokens are not included because OIDC tokens rotate per job.
+func partitionKey(baseURL string, id *api.Identity) (string, error) {
+	u, err := CheckCredentialURL(baseURL, false)
+	if err != nil {
+		return "", err
+	}
+	if id == nil || id.Namespace == "" {
+		return "", errors.New("server returned an identity without a namespace")
+	}
+	reads := id.ReadScopes
+	if reads == nil {
+		reads = []string{}
+	}
+	b, err := json.Marshal(struct {
+		V          int      `json:"v"`
+		URL        string   `json:"url"`
+		Kind       string   `json:"kind"`
+		Namespace  string   `json:"namespace"`
+		WriteScope string   `json:"write_scope"`
+		ReadScopes []string `json:"read_scopes"`
+	}{1, u.Scheme + "://" + strings.ToLower(u.Host) + strings.TrimRight(u.EscapedPath(), "/"),
+		id.Kind, id.Namespace, id.WriteScope, reads})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// removeSession deletes this process's temporary partition, if any.
+func (p *Prog) removeSession() {
+	if p.session {
+		os.RemoveAll(p.root) //nolint:errcheck
+		p.session = false
+	}
 }
 
 func (p *Prog) remoteOK() bool { return p.opts.Remote != nil && !p.remoteDisabled.Load() }
@@ -131,6 +235,7 @@ func (p *Prog) noteRemote(err error) {
 
 // Run serves the protocol until close or EOF.
 func (p *Prog) Run(ctx context.Context, in io.Reader, out io.Writer) error {
+	defer p.removeSession()
 	p.out = bufio.NewWriter(out)
 	if err := p.send(&Response{ID: 0, KnownCommands: []Cmd{CmdGet, CmdPut, CmdClose}}); err != nil {
 		return err
@@ -198,6 +303,7 @@ func (p *Prog) shutdown() {
 		}
 		p.uploads = nil
 	}
+	p.removeSession()
 	s := &p.Stats
 	if p.opts.Remote != nil {
 		p.log.Info("cache stats",
@@ -214,12 +320,12 @@ func (p *Prog) shutdown() {
 //	a/<xx>/<actionID hex>   "v1 <outputID hex> <size> <unixnano>\n"
 func (p *Prog) outputPath(outputID []byte) string {
 	h := hex.EncodeToString(outputID)
-	return filepath.Join(p.opts.Dir, "o", h[:2], h)
+	return filepath.Join(p.root, "o", h[:2], h)
 }
 
 func (p *Prog) actionPath(actionID []byte) string {
 	h := hex.EncodeToString(actionID)
-	return filepath.Join(p.opts.Dir, "a", h[:2], h)
+	return filepath.Join(p.root, "a", h[:2], h)
 }
 
 type localEntry struct {
@@ -259,7 +365,7 @@ func (p *Prog) writeLocal(actionID, outputID []byte, size int64, t time.Time) er
 		return err
 	}
 	data := fmt.Sprintf("v1 %x %d %d\n", outputID, size, t.UnixNano())
-	return writeAtomic(p.opts.Dir, path, []byte(data))
+	return writeAtomic(p.root, path, []byte(data))
 }
 
 func writeAtomic(dir, path string, data []byte) error {
@@ -328,7 +434,7 @@ func (p *Prog) handleGet(ctx context.Context, req *Request) *Response {
 func (p *Prog) remoteGet(ctx context.Context, req *Request) (*Response, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.opts.GetTimeout)
 	defer cancel()
-	f, err := os.CreateTemp(filepath.Join(p.opts.Dir, "tmp"), "get-*")
+	f, err := os.CreateTemp(filepath.Join(p.root, "tmp"), "get-*")
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +474,7 @@ func (p *Prog) remoteGet(ctx context.Context, req *Request) (*Response, error) {
 // upload. It returns nil only when the protocol stream is broken.
 func (p *Prog) handlePut(req *Request, r *reader) *Response {
 	p.Stats.Puts.Add(1)
-	f, err := os.CreateTemp(filepath.Join(p.opts.Dir, "tmp"), "put-*")
+	f, err := os.CreateTemp(filepath.Join(p.root, "tmp"), "put-*")
 	if err != nil {
 		if req.BodySize > 0 {
 			if _, err := r.body(io.Discard); err != nil {

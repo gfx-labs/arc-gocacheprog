@@ -30,6 +30,7 @@ type Server struct {
 	auth    *Authenticator
 	log     *slog.Logger
 	uploads *uploadLimiter
+	limits  *Limiter
 }
 
 func New(cfg Config, store *Store, blobs *BlobStore, auth *Authenticator, log *slog.Logger) *Server {
@@ -37,7 +38,8 @@ func New(cfg Config, store *Store, blobs *BlobStore, auth *Authenticator, log *s
 		log = slog.Default()
 	}
 	return &Server{cfg: cfg, store: store, blobs: blobs, auth: auth, log: log,
-		uploads: newUploadLimiter(cfg.Storage.MaxConcurrentUploads, cfg.Storage.MaxConcurrentUploadsPerNamespace)}
+		uploads: newUploadLimiter(cfg.Storage.MaxConcurrentUploads, cfg.Storage.MaxConcurrentUploadsPerNamespace),
+		limits:  NewLimiter(cfg.Limits)}
 }
 
 // uploadLimiter bounds concurrent PUTs (spooled bodies and S3 writes) in
@@ -94,17 +96,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+api.PathActions+"{id}", s.authed(s.handleGet))
 	mux.HandleFunc("PUT "+api.PathActions+"{id}", s.authed(s.handlePut))
 	mux.HandleFunc("POST "+api.PathActions+"{id}/link", s.authed(s.handleLink))
-	// http.Server timeouts do not cancel the request context, so database,
-	// S3 and JWKS calls get their own deadline.
+	// Bound backend work explicitly rather than relying on socket deadlines,
+	// and set those too in case the embedding server has none.
 	timeout := s.cfg.Storage.RequestTimeout
 	if timeout <= 0 {
-		return mux
+		return s.limits.Middleware(mux)
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.limits.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		rc.SetReadDeadline(time.Now().Add(timeout)) //nolint:errcheck
+		// Leave time to write the error response after the context expires.
+		rc.SetWriteDeadline(time.Now().Add(timeout + cleanupTimeout)) //nolint:errcheck
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		mux.ServeHTTP(w, r.WithContext(ctx))
-	})
+	}))
 }
 
 type authedHandler func(w http.ResponseWriter, r *http.Request, id *Identity)
@@ -258,6 +264,10 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request, id *Identity
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if wait, ok := s.limits.AdmitWrite(id.Namespace, 0); !ok {
+		writeLimited(w, wait, "write rate limit")
+		return
+	}
 	ctx := r.Context()
 	b, err := s.store.LinkableBlob(ctx, id.Namespace, id.ReadScopes, m.blake3)
 	if err != nil {
@@ -294,6 +304,10 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, id *Identity)
 	}
 	if r.ContentLength != m.size {
 		writeErr(w, http.StatusBadRequest, "Content-Length must equal "+api.HeaderSize)
+		return
+	}
+	if wait, ok := s.limits.AdmitWrite(id.Namespace, m.size); !ok {
+		writeLimited(w, wait, "write rate limit")
 		return
 	}
 	release, ok := s.uploads.acquire(id.Namespace)

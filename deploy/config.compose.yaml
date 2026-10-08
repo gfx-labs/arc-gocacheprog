@@ -12,6 +12,13 @@ s3:
   use_path_style: true
   create_bucket: true
 
+storage:
+  # Keep temporary uploads within the server container's 1 GiB /tmp limit.
+  max_blob_bytes: 16777216
+  max_concurrent_uploads: 8
+  max_concurrent_uploads_per_namespace: 4
+  request_timeout: 2m
+
 auth:
   static:
     - name: compose

@@ -111,7 +111,10 @@ func run() error {
 		return enc.Encode(id)
 	}
 
-	p, err := client.New(client.Options{Dir: *dir, Remote: remote, ReadOnly: *readOnly, Log: log})
+	p, err := client.New(client.Options{
+		Dir: *dir, Remote: remote, RemoteUnavailable: *url != "" && remote == nil,
+		ReadOnly: *readOnly, Log: log,
+	})
 	if err != nil {
 		return err
 	}
