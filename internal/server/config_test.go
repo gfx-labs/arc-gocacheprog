@@ -25,6 +25,8 @@ auth:
 		{"misspelled read-only policy", "      readonly: true\n", "readonly"},
 		{"unknown upload limit", "storage:\n  max_blob_byte: 1\n", "max_blob_byte"},
 		{"unbounded request lifetime", "storage:\n  request_timeout: 0s\n", "storage.request_timeout"},
+		{"zero tenant upload limit", "storage:\n  max_concurrent_uploads_per_namespace: 0\n", "storage.max_concurrent_uploads_per_namespace"},
+		{"negative tenant upload limit", "storage:\n  max_concurrent_uploads_per_namespace: -1\n", "storage.max_concurrent_uploads_per_namespace"},
 		{"negative request lifetime", "storage:\n  request_timeout: -1s\n", "storage.request_timeout"},
 		{"zero blob limit", "storage:\n  max_blob_bytes: 0\n", "storage.max_blob_bytes"},
 		{"overflowing blob limit", "storage:\n  max_blob_bytes: 9223372036854775807\n", "storage.max_blob_bytes"},

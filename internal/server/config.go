@@ -46,6 +46,8 @@ type Storage struct {
 	TempDir string `yaml:"temp_dir"`
 	// MaxConcurrentUploads bounds parallel PUTs. Excess requests get 503.
 	MaxConcurrentUploads int `yaml:"max_concurrent_uploads"`
+	// MaxConcurrentUploadsPerNamespace prevents one tenant from taking every upload slot.
+	MaxConcurrentUploadsPerNamespace int `yaml:"max_concurrent_uploads_per_namespace"`
 	// RequestTimeout bounds reading a request and writing a response.
 	RequestTimeout time.Duration `yaml:"request_timeout"`
 }
@@ -129,11 +131,12 @@ func DefaultConfig() Config {
 			Prefix: "gocache/",
 		},
 		Storage: Storage{
-			InlineMaxBytes:       32 << 10,
-			MaxBlobBytes:         1 << 30,
-			TouchInterval:        time.Hour,
-			MaxConcurrentUploads: 32,
-			RequestTimeout:       15 * time.Minute,
+			InlineMaxBytes:                   32 << 10,
+			MaxBlobBytes:                     1 << 30,
+			TouchInterval:                    time.Hour,
+			MaxConcurrentUploads:             32,
+			MaxConcurrentUploadsPerNamespace: 8,
+			RequestTimeout:                   15 * time.Minute,
 		},
 		GC: GCConfig{
 			Enabled:           true,
@@ -224,6 +227,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.MaxConcurrentUploads <= 0 {
 		return fmt.Errorf("storage.max_concurrent_uploads must be > 0")
+	}
+	if c.Storage.MaxConcurrentUploadsPerNamespace <= 0 {
+		return fmt.Errorf("storage.max_concurrent_uploads_per_namespace must be > 0")
 	}
 	if c.GC.UploadLease <= 0 || c.GC.UploadLease < c.Storage.RequestTimeout {
 		return fmt.Errorf("gc.upload_lease must be > 0 and >= storage.request_timeout")
