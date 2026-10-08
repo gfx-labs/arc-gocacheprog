@@ -40,6 +40,7 @@ auth:
 		{"invalid request rate", "limits:\n  requests_per_sec: .nan\n", "requests_per_sec"},
 		{"unbounded write burst", "limits:\n  write_burst: 0\n", "write_burst"},
 		{"invalid write rate", "limits:\n  writes_per_sec: .inf\n", "writes_per_sec"},
+		{"unlimited package rate", "limits:\n  writes_per_sec: 1.7976931348623157e308\n", "writes_per_sec"},
 		{"upload above byte burst", "limits:\n  write_bytes_burst: 1024\n", "write_bytes_burst"},
 		{"unbounded tenant map", "limits:\n  max_tenants: 0\n", "max_tenants"},
 		{"plaintext OIDC discovery", "  gha:\n    allowed_owners: [gfx-labs]\n    issuer: http://issuer.example.com\n", "auth.gha.issuer"},

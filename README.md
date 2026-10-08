@@ -118,7 +118,7 @@ arc-gocacheprog-server -config config.yaml
 
 `ARC_GOCACHE_CONFIG` sets the default path. `${VAR}` references in the file are expanded from the environment. Unknown YAML fields and unsafe resource limits are rejected. [deploy/config.example.yaml](deploy/config.example.yaml) lists every option with comments. Schema migrations run at startup.
 
-Read `deploy/SECURITY.md` before production deployment. `SECURITY_AUDIT.md` records the findings, fixes, regression evidence, and validation limits. The server needs a trusted HTTPS proxy, private database and object storage, and storage monitoring. In-process admission limits apply per replica, not across the fleet. Namespace quotas are asynchronous GC policies, not hard storage admission limits.
+Read `deploy/SECURITY.md` before production deployment. The server needs a trusted HTTPS proxy, private database and object storage, and storage monitoring. In-process admission limits apply per replica, not across the fleet. Namespace quotas are asynchronous GC policies, not hard storage admission limits.
 
 Container image: `ghcr.io/gfx-labs/arc-gocacheprog`. The default command reads `/etc/arc-gocacheprog/config.yaml`. The image runs as a non-root user on distroless.
 
