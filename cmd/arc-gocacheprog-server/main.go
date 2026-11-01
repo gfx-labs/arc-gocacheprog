@@ -73,6 +73,12 @@ func run() error {
 		return err
 	}
 	blobs := server.NewBlobStore(s3c, cfg.S3.Bucket, cfg.S3.Prefix)
+	if cfg.Storage.DiskCache.Dir != "" {
+		if err := blobs.EnableDiskCache(cfg.Storage.DiskCache, log); err != nil {
+			return err
+		}
+		log.Info("disk cache enabled", "dir", cfg.Storage.DiskCache.Dir, "max_bytes", cfg.Storage.DiskCache.MaxBytes)
+	}
 	if cfg.S3.CreateBucket {
 		if err := blobs.EnsureBucket(ctx); err != nil {
 			return err

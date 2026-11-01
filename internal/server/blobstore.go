@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -25,6 +26,8 @@ type BlobStore struct {
 	client *s3.Client
 	bucket string
 	prefix string
+	// disk is an optional local cache of recently used blobs.
+	disk *diskCache
 }
 
 func NewS3Client(ctx context.Context, c S3Config) (*s3.Client, error) {
@@ -56,6 +59,16 @@ func NewS3Client(ctx context.Context, c S3Config) (*s3.Client, error) {
 
 func NewBlobStore(client *s3.Client, bucket, prefix string) *BlobStore {
 	return &BlobStore{client: client, bucket: bucket, prefix: prefix}
+}
+
+// EnableDiskCache serves repeated reads from local disk instead of S3.
+func (b *BlobStore) EnableDiskCache(cfg DiskCacheConfig, log *slog.Logger) error {
+	c, err := newDiskCache(cfg, log)
+	if err != nil {
+		return fmt.Errorf("disk cache: %w", err)
+	}
+	b.disk = c
+	return nil
 }
 
 // Key returns the object key for a BLAKE3 hash.
@@ -113,13 +126,23 @@ func (b *BlobStore) Put(ctx context.Context, hash []byte, f *os.File, size int64
 	if err != nil {
 		return fmt.Errorf("s3 put %x: %w", hash, err)
 	}
+	if b.disk != nil {
+		b.disk.storeFile(ctx, hash, f, size)
+	}
 	return nil
 }
 
 // ErrBlobMissing is returned when the object does not exist in S3.
 var ErrBlobMissing = errors.New("blob missing from object store")
 
-func (b *BlobStore) Get(ctx context.Context, hash []byte) (io.ReadCloser, error) {
+// Get returns the blob. size is the expected length, used to validate a
+// cached copy and to bound what is written to the disk cache.
+func (b *BlobStore) Get(ctx context.Context, hash []byte, size int64) (io.ReadCloser, error) {
+	if b.disk != nil {
+		if r := b.disk.open(ctx, hash, size); r != nil {
+			return r, nil
+		}
+	}
 	out, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(b.Key(hash)),
@@ -131,6 +154,9 @@ func (b *BlobStore) Get(ctx context.Context, hash []byte) (io.ReadCloser, error)
 			return nil, ErrBlobMissing
 		}
 		return nil, fmt.Errorf("s3 get %x: %w", hash, err)
+	}
+	if b.disk != nil {
+		return b.disk.tee(ctx, out.Body, hash, size), nil
 	}
 	return out.Body, nil
 }
@@ -153,6 +179,9 @@ func (b *BlobStore) Exists(ctx context.Context, hash []byte) (bool, error) {
 }
 
 func (b *BlobStore) Delete(ctx context.Context, hash []byte) error {
+	if b.disk != nil {
+		b.disk.remove(hash)
+	}
 	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(b.Key(hash)),

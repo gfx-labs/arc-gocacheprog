@@ -216,7 +216,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, id *Identity)
 	if e.IsInline {
 		body = io.NopCloser(bytes.NewReader(e.Inline))
 	} else {
-		body, err = s.blobs.Get(ctx, e.BlobHash)
+		body, err = s.blobs.Get(ctx, e.BlobHash, e.Size)
 		if errors.Is(err, ErrBlobMissing) {
 			log := s.reqLog(r).With("hash", hex.EncodeToString(e.BlobHash))
 			log.Warn("blob missing from object store")

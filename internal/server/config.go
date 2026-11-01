@@ -54,6 +54,8 @@ type Storage struct {
 	MaxConcurrentUploadsPerNamespace int `yaml:"max_concurrent_uploads_per_namespace"`
 	// RequestTimeout bounds reading a request and writing a response.
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// DiskCache keeps recently used S3 blobs on local disk.
+	DiskCache DiskCacheConfig `yaml:"disk_cache"`
 }
 
 type GCConfig struct {
@@ -231,6 +233,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.RequestTimeout <= 0 {
 		return fmt.Errorf("storage.request_timeout must be > 0")
+	}
+	if dc := c.Storage.DiskCache; dc.Dir != "" && dc.MaxBytes <= 0 {
+		return fmt.Errorf("storage.disk_cache.max_bytes must be > 0 when disk_cache.dir is set")
+	}
+	if c.Storage.DiskCache.MaxBlobBytes < 0 {
+		return fmt.Errorf("storage.disk_cache.max_blob_bytes must be >= 0")
 	}
 	if c.Storage.TouchInterval < 0 {
 		return fmt.Errorf("storage.touch_interval must be >= 0")
