@@ -37,7 +37,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4 (v4.4.1)
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4 (v4.6.0)
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4 (v4.7.0)
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -65,8 +65,8 @@ jobs:
           cache-from: type=gha
       - name: Scan image (Grype, fail on high)
         env:
-          # anchore/grype v0.120.1
-          GRYPE_IMAGE: anchore/grype@sha256:e4a44ef45d285b829ce6efe2642980329661bd2d18eab5fc539138d4adaebbbe
+          # anchore/grype v0.121.0
+          GRYPE_IMAGE: anchore/grype@sha256:621d56d1d68106b787022c81546f7e0a36202a25d1239f0c20195fab8c16f7ea
         run: |
           for platform in linux/amd64 linux/arm64; do
             docker run --rm --cap-drop ALL --security-opt no-new-privileges:true \
