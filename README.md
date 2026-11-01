@@ -3,7 +3,7 @@
 A remote build cache for the Go toolchain. It has two binaries:
 
 - `arc-gocacheprog` is a `GOCACHEPROG` program. The `go` command runs it as a subprocess and uses it to get and put build cache entries.
-- `arc-gocacheprog-server` is an HTTP server that stores the entries. Metadata lives in Postgres. Blobs larger than 32 KiB go to S3 (SeaweedFS in production). Smaller blobs are stored inline in Postgres.
+- `arc-gocacheprog-server` is an HTTP server that stores the entries. Metadata lives in Postgres. Blobs larger than 32 KiB go to S3 (SeaweedFS in production). Smaller blobs are stored inline in Postgres. With `storage.disk_cache` set, the server also keeps recently used S3 blobs on local disk (LRU, written on upload and on S3 reads) and serves repeat reads from it. Blobs are content addressed, so cached copies never go stale, and each copy is BLAKE3-verified before it is served.
 
 The client keeps a local on-disk cache and falls back to the server on a local miss. If the server is unreachable or auth fails, the build continues with the local cache only.
 

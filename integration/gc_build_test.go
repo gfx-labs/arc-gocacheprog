@@ -47,7 +47,7 @@ func TestGC(t *testing.T) {
 	if st.ExpiredEntries != 2 || st.DeletedBlobs != 1 {
 		t.Fatalf("unexpected stats %+v", st)
 	}
-	if _, err := e.Blobs.Get(ctx, old.blake3); !errors.Is(err, server.ErrBlobMissing) {
+	if _, err := e.Blobs.Get(ctx, old.blake3, int64(len(old.data))); !errors.Is(err, server.ErrBlobMissing) {
 		t.Fatalf("old blob still in s3: %v", err)
 	}
 	if got, _ := get(t, r, action("fresh")); !bytes.Equal(got, fresh.data) {

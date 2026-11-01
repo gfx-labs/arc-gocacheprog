@@ -2,8 +2,8 @@
 
 # Base images are pinned to multi-arch index digests. Refresh with
 #   docker buildx imagetools inspect <image>:<tag>
-# golang:1.27 resolved to 1.27.1-trixie on 2026-10-07.
-FROM --platform=$BUILDPLATFORM golang:1.27@sha256:162be5298a40ed317005c8339c6de4d10d3eef336d66dc8e9259b03ab9d3a6d2 AS build
+# golang:1.27.3-trixie resolved on 2026-11-01.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src

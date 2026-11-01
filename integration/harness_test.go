@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
@@ -209,10 +210,12 @@ type env struct {
 	Issuer *fakeIssuer
 	// RuntimeIssuer signs ACTIONS_RUNTIME_TOKEN style tokens with its own keys.
 	RuntimeIssuer *fakeIssuer
-	Store  *server.Store
-	Blobs  *server.BlobStore
-	Config server.Config
-	GC     *server.GC
+	Store         *server.Store
+	Blobs         *server.BlobStore
+	Config        server.Config
+	GC            *server.GC
+	// S3 reaches the object store directly, bypassing the server.
+	S3 *s3.Client
 }
 
 const testKey = "local-test-key"
@@ -230,9 +233,9 @@ func newEnv(t testing.TB, mutate ...func(*server.Config)) *env {
 	cfg.Storage.TempDir = t.TempDir()
 	cfg.GC.Enabled = false
 	cfg.Auth.GHA = &server.GHAConfig{
-		Issuer:             iss.URL(),
-		AllowedOwners:      []string{"gfx-labs"},
-		DefaultRefs:        []string{"main"},
+		Issuer:              iss.URL(),
+		AllowedOwners:       []string{"gfx-labs"},
+		DefaultRefs:         []string{"main"},
 		AcceptRuntimeToken:  true,
 		RuntimeTokenIssuers: []string{rtIss.URL()},
 	}
@@ -264,6 +267,11 @@ func newEnv(t testing.TB, mutate ...func(*server.Config)) *env {
 	if err := blobs.EnsureBucket(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if cfg.Storage.DiskCache.Dir != "" {
+		if err := blobs.EnableDiskCache(cfg.Storage.DiskCache, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	auth, err := server.NewAuthenticator(cfg.Auth)
 	if err != nil {
@@ -277,7 +285,7 @@ func newEnv(t testing.TB, mutate ...func(*server.Config)) *env {
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
 	return &env{
-		URL: hs.URL, Issuer: iss, RuntimeIssuer: rtIss, Store: store, Blobs: blobs, Config: cfg,
+		URL: hs.URL, Issuer: iss, RuntimeIssuer: rtIss, Store: store, Blobs: blobs, Config: cfg, S3: s3c,
 		GC: server.NewGC(cfg.GC, store, blobs, log),
 	}
 }

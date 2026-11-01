@@ -43,6 +43,15 @@ storage:
   touch_interval: 1h
   # Large uploads are spooled here while they are hashed. Empty uses the OS temp dir.
   temp_dir: ""
+  # Keep recently used S3 blobs on local disk and serve repeat reads from it.
+  # Blobs are content addressed, so cached copies never go stale; each copy is
+  # BLAKE3-verified before it is used. Empty dir disables the cache.
+  disk_cache:
+    dir: ""
+    # Least recently used blobs are evicted above this size.
+    max_bytes: 21474836480
+    # Larger blobs are always read from S3. 0 caches every size.
+    max_blob_bytes: 0
 
 limits:
   # Admission limits apply per replica. Restarts grant a new burst.

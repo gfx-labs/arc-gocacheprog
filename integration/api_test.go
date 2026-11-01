@@ -328,7 +328,7 @@ func TestUploadVerification(t *testing.T) {
 	if parts := strings.Split(h, "/"); len(parts) != 3 || len(parts[2]) != 64 || parts[0] != parts[2][:2] || parts[1] != parts[2][2:4] {
 		t.Fatalf("unexpected key layout %q", key)
 	}
-	rc, err := e.Blobs.Get(context.Background(), b.blake3)
+	rc, err := e.Blobs.Get(context.Background(), b.blake3, int64(len(b.data)))
 	if err != nil {
 		t.Fatalf("large blob not in s3: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestUploadVerification(t *testing.T) {
 	if err := put(t, r, action("small"), small); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.Blobs.Get(context.Background(), small.blake3); !errors.Is(err, server.ErrBlobMissing) {
+	if _, err := e.Blobs.Get(context.Background(), small.blake3, int64(len(small.data))); !errors.Is(err, server.ErrBlobMissing) {
 		t.Fatalf("small blob should be inline, s3 get returned %v", err)
 	}
 
